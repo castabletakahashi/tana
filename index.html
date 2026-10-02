@@ -33,6 +33,7 @@ header.bar h1{font-size:17px;margin:0;font-weight:700;flex:1;min-width:0;overflo
 .net.off::before{content:"●";color:var(--bad);margin-right:4px}
 .queue{font-size:13px;padding:2px 8px;border-radius:4px;background:var(--panel);border:1px solid var(--line);white-space:nowrap}
 .queue.has{background:var(--signal);border-color:var(--signal);font-weight:700}
+.ver{font-size:12px;white-space:nowrap;opacity:.75}
 main{padding:14px 16px}
 h2{font-size:15px;margin:22px 0 8px;color:var(--steel);font-weight:700}
 p{margin:6px 0}
@@ -133,12 +134,13 @@ nav.tabs .badge{position:absolute;top:6px;right:calc(50% - 22px);background:var(
 <div id="app"></div>
 <div id="toast" role="status" aria-live="polite"></div>
 <div id="cam" aria-modal="true" role="dialog" aria-label="QRコードの読み取り">
-  <video id="camVideo" playsinline muted></video>
+  <video id="camVideo" playsinline webkit-playsinline muted autoplay></video>
   <div class="frame"></div>
-  <div class="msg">QRコードを枠に入れてください</div>
-  <div class="ctl"><button class="btn block big" data-act="camClose">閉じる</button></div>
+  <div class="msg" id="camMsg">QRコードを枠に入れてください</div>
+  <div class="ctl"><button class="btn big" data-act="photoScan" style="flex:1">写真で読む</button><button class="btn big" data-act="camClose" style="flex:1">閉じる</button></div>
 </div>
 <canvas id="camCanvas" hidden></canvas>
+<input type="file" id="photoIn" accept="image/*" capture="environment" hidden>
 <input type="file" id="fileIn" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden>
 <input type="file" id="filesIn" accept=".csv,text/csv" multiple hidden>
 <script>/* jsQR 1.4.0 (Apache-2.0) */
@@ -10256,7 +10258,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-2.5';
+const APP_VERSION = 'file-2.8';
+const APP_VERSION_LABEL = 'v' + APP_VERSION.replace(/^file-/, '');   // 画面の右上に出す版数(例 v2.8)
 /* 品目マスタ(埋め込みなし) */
 const MASTER_SEED = [];   // v2.2: 品目マスタは埋め込まない(公開URLに品名・得意先名を載せないため)。初回に「マスタCSVを読み込む」
 const CONFIG_SEED = [["ImportColumns","1,2,3,6,4","GEN取込で貼り付けるデータの列位置(品目コード,品目名,規格,管理単位,理論在庫)。既定はGEN棚卸登録のエクセル出力B〜G列"],["GenApiUrl","","品目マスタを取得するGEN APIのURL。トークンをURLに含める方式なら {token} と書く"],["GenApiAuthHeader","Authorization","トークンを送るHTTPヘッダーの名前。URLに含める方式なら空欄"],["GenApiAuthFormat","Bearer {token}","認証ヘッダーの値の書式。{token} が各自の端末に保存したトークンに置き換わる"],["GenApiListPath","data","応答JSONで品目の一覧が入っている項目名(例 data / data.items)。応答全体が一覧なら空欄"],["GenApiFieldCode","item_code","応答JSONでの品目コードの項目名"],["GenApiFieldName","item_name","応答JSONでの品目名の項目名"],["GenApiFieldSpec","spec","応答JSONでの規格の項目名(ない場合は空欄)"],["GenApiFieldUnit","unit","応答JSONでの管理単位の項目名(ない場合は空欄)"]];
@@ -10739,12 +10742,22 @@ function bar(title) {
   const n = unexported().length;
   const warn = isIOS && !isStandalone()
     ? `<div class="note" style="margin:8px 16px 0">Safari で開いています。<b>カウントはホーム画面の「棚卸カウント」から起動してください。</b>iPhone では Safari とホーム画面のアプリはデータが別々で、こちらには登録・品目マスタが入っていません。</div>` : '';
-  return `<header class="bar"><h1>${esc(title)}</h1><span class="queue ${n ? 'has' : ''}">未書き出し: ${n}件</span></header>${warn}`;
+  const upd = S.updateReady
+    ? `<div class="note" style="margin:8px 16px 0">新しい版のアプリが届きました。<button class="btn sm primary" data-act="reloadApp">開き直す</button>(登録した明細は消えません)</div>` : '';
+  return `<header class="bar"><h1>${esc(title)}</h1><span class="ver" title="アプリの版数">${esc(APP_VERSION_LABEL)}</span><span class="queue ${n ? 'has' : ''}">未書き出し: ${n}件</span></header>${upd}${warn}`;
 }
 /* 読取画面に出す注意(設定・マスタの未読込・書き出し忘れ) */
+// 棚卸回は「年-月」(yyyy-mm。例 2026-11)。全角・「2026/11」「202611」「2026年11月」も受け付けて yyyy-mm にそろえる。形式外は ''
+function normSession(v) {
+  const s = String(v || '').normalize('NFKC').trim().replace(/月$/, '').replace(/[\/.年\s]+/g, '-');
+  const m = s.match(/^(20\d\d)-?(\d{1,2})$/);
+  if (!m || +m[2] < 1 || +m[2] > 12) return '';
+  return m[1] + '-' + String(+m[2]).padStart(2, '0');
+}
 function notices() {
   const out = [];
   if (!S.session || !S.user.name) out.push(`棚卸回と担当者の名前を設定してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
+  else if (!normSession(S.session)) out.push(`棚卸回「${esc(S.session)}」は古い形式です。設定で <b>年-月</b>(例 2026-11)に直してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
   if (!masterCount()) out.push(`品目マスタが入っていません。管理者が Teams に置いた「品目マスタ_….csv」を読み込んでください。<button class="btn sm" data-act="masterIn">マスタCSVを読み込む</button>`);
   const u = unexported();
   if (u.length) {
@@ -10776,6 +10789,7 @@ function scrScan() {
       <button class="btn primary big" data-act="camOpen" style="flex:1.2">カメラで読む</button>
       <input type="text" id="codeIn" placeholder="品目コード または 品名で探す" value="${esc(S.codeQuery || S.code)}" autocapitalize="off" autocomplete="off" enterkeyhint="search" aria-label="品目コード または 品名">
     </div>
+    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="photoScan">写真で読む(カメラが真っ暗な時)</button></div>
     <div id="sugg">${S.codeQuery ? suggHtml(S.codeQuery) : ''}</div>
     ${it ? `
     ${ps.length > 1 || it.Packs ? `<div class="field"><label for="packSel">荷姿</label><select id="packSel">${ps.map((x, i) => `<option value="${i}" ${i === S.packIdx ? 'selected' : ''}>${esc(x.n)}${x.f !== 1 ? '(×' + fmtN(x.f) + ')' : ''}</option>`).join('')}</select></div>` : ''}
@@ -10841,7 +10855,7 @@ function scrMaster() {
   return bar('品目マスタ') + `<main>
     ${M.err ? `<div class="err">${esc(M.err)}</div>` : ''}
     <p class="muted small">この端末のマスタ: ${rows.length}件(${esc(LS.get('f_master_at', '未読込'))})</p>
-    ${!rows.length ? `<div class="note">品目マスタが入っていません。Teams の「品目マスタ」フォルダにある最新の <b>品目マスタ_….csv</b> を「マスタCSVを読み込む」で読み込んでください。</div>` : ''}
+    ${!rows.length ? `<div class="note">品目マスタが入っていません。管理者が指定した Teams のフォルダにある最新の <b>品目マスタ_….csv</b> を「マスタCSVを読み込む」で読み込んでください。</div>` : ''}
     <div class="row"><button class="btn primary" data-go="masterImport">GENから更新</button><button class="btn" data-act="newItem">新規登録</button></div>
     <div class="row" style="margin-top:8px"><button class="btn" data-act="masterOut">マスタCSVを書き出す</button><button class="btn" data-act="masterIn">マスタCSVを読み込む</button></div>
     <p class="muted small">管理者の端末で「書き出す」→ 所定フォルダに保存 → 他の端末で「読み込む」で全員のマスタをそろえます。読み込みは統合なので、この端末で追加・変更してまだ管理者に渡していない品目は消えません。この端末での変更は、カウントの「CSVを書き出す」と一緒に「マスタ変更CSV」として管理者に渡ります。</p>
@@ -10971,7 +10985,7 @@ function scrSetting() {
   return bar('設定') + `<main>
     <h2>棚卸回と担当者(CSVのファイル名に入ります)</h2>
     <div class="panel">
-      <div class="field" style="margin-top:0"><label for="sesIn">棚卸回(例 64期_2026-11末。全員同じ名前にする)</label><input type="text" id="sesIn" value="${esc(S.session)}" autocomplete="off"></div>
+      <div class="field" style="margin-top:0"><label for="sesIn">棚卸回(年-月。例 2026-11。全員同じにする)</label><input type="month" id="sesIn" value="${esc(normSession(S.session))}" placeholder="2026-11" autocomplete="off"></div>
       <div class="field"><label for="nameIn">担当者の名前</label><input type="text" id="nameIn" value="${esc(S.user.name)}" autocomplete="off"></div>
       <div class="field"><label for="mailIn">メール(任意)</label><input type="email" id="mailIn" value="${esc(S.user.email)}" autocomplete="off"></div>
       <button class="btn primary block" data-act="saveBasic" style="margin-top:10px">保存</button>
@@ -11026,15 +11040,49 @@ function openEdit(code, isNew) {
 }
 
 /* ---------- カメラ(jsQR) ---------- */
+// ホーム画面から起動したiPhone(standalone)では、映像が真っ暗のままになることがある。
+// 対策: 先に画面を表示してから映像をつなぐ / 映像が来なければ一度つなぎ直す / それでもだめなら「写真で読む」へ案内
 const Cam = {
-  stream: null, raf: 0,
+  stream: null, raf: 0, timer: 0, retried: false,
+  msg(t) { const m = $('#camMsg'); if (m) m.textContent = t; },
+  shown() { return $('#cam').classList.contains('show'); },
+  async start(constraints) {
+    const v = $('#camVideo');
+    this.stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
+    v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
+    v.srcObject = null; v.srcObject = this.stream;
+    await new Promise(res => { if (v.readyState >= 1) return res(); v.onloadedmetadata = () => res(); setTimeout(res, 3000); });
+    await v.play().catch(() => {});
+  },
+  stopTracks() { if (this.stream) this.stream.getTracks().forEach(t => t.stop()); this.stream = null; },
   async open() {
     if (typeof jsQR === 'undefined') return toast('QR読取のライブラリが読み込めません。コードを入力してください');
-    if (!navigator.mediaDevices?.getUserMedia) return toast('この開き方ではカメラを使えません(HTTPSのURLで開いてください)。コードは入力できます', 4500);
-    try { this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false }); }
-    catch (e) { return toast('カメラを使えません(' + e.name + ')。設定でカメラを許可するか、コードを入力してください', 4500); }
-    const v = $('#camVideo'); v.srcObject = this.stream; $('#cam').classList.add('show'); await v.play().catch(() => {});
-    const c = $('#camCanvas'), ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!navigator.mediaDevices?.getUserMedia) return this.photo();
+    this.retried = false;
+    $('#cam').classList.add('show'); this.msg('カメラを起動しています…');
+    try { await this.start({ facingMode: 'environment', width: { ideal: 1280 } }); }
+    catch (e) { this.close(); return toast('カメラを使えません(' + e.name + ')。「写真で読む」かコードの入力で登録できます', 4500); }
+    if (!this.shown()) return this.stopTracks(); // 起動中に「閉じる」が押された
+    this.msg('QRコードを枠に入れてください');
+    this.loop();
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.watch(), 2500);
+  },
+  // 映像が来ているかの確認。来ていなければ1回だけ条件を簡単にしてつなぎ直す
+  async watch() {
+    const v = $('#camVideo');
+    if (!this.stream || (v.videoWidth && !v.paused)) return;
+    if (!this.retried) {
+      this.retried = true; this.msg('カメラをつなぎ直しています…'); this.stopTracks();
+      try { await this.start({ facingMode: 'environment' }); } catch (e) { this.stream = null; }
+      if (!this.shown()) return this.stopTracks();
+      if (this.stream) { this.msg('QRコードを枠に入れてください'); this.loop(); this.timer = setTimeout(() => this.watch(), 2500); return; }
+    }
+    this.msg('カメラの映像が出ません。下の「写真で読む」を使ってください');
+  },
+  loop() {
+    cancelAnimationFrame(this.raf);
+    const v = $('#camVideo'), c = $('#camCanvas'), ctx = c.getContext('2d', { willReadFrequently: true });
     const tick = () => {
       if (!this.stream) return;
       if (v.readyState >= 2 && v.videoWidth) {
@@ -11046,13 +11094,42 @@ const Cam = {
     };
     this.raf = requestAnimationFrame(tick);
   },
-  close() { cancelAnimationFrame(this.raf); if (this.stream) this.stream.getTracks().forEach(t => t.stop()); this.stream = null; $('#cam').classList.remove('show'); },
+  close() { clearTimeout(this.timer); cancelAnimationFrame(this.raf); this.stopTracks(); const v = $('#camVideo'); if (v) v.srcObject = null; $('#cam').classList.remove('show'); this.msg('QRコードを枠に入れてください'); },
+  // iPhone標準のカメラで撮った写真からQRを読む(映像が出ない端末・開き方でも使える)
+  photo() {
+    if (typeof jsQR === 'undefined') return toast('QR読取のライブラリが読み込めません。コードを入力してください');
+    this.close();
+    const i = $('#photoIn'); i.value = '';
+    i.onchange = async () => {
+      const f = i.files[0]; if (!f) return;
+      const code = await decodeQrImage(f).catch(() => '');
+      if (code) onScanned(code); else toast('写真からQRが見つかりませんでした。QRを大きく・正面から撮り直すか、コードを入力してください', 4500);
+    };
+    i.click();
+  },
 };
+async function decodeQrImage(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = url; });
+    const c = document.createElement('canvas'), ctx = c.getContext('2d', { willReadFrequently: true });
+    for (const max of [1600, 1000, 640, 2400]) {
+      const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.round(img.naturalWidth * k), h = Math.round(img.naturalHeight * k);
+      c.width = w; c.height = h; ctx.drawImage(img, 0, 0, w, h);
+      const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'attemptBoth' });
+      if (r && r.data && r.data.trim()) return r.data.trim();
+    }
+    return '';
+  } finally { URL.revokeObjectURL(url); }
+}
+// アプリを裏に回したらカメラを止める(戻った時に真っ暗になるのを防ぐ)
+document.addEventListener('visibilitychange', () => { if (document.hidden && Cam.stream) Cam.close(); });
 function onScanned(code) { if (navigator.vibrate) navigator.vibrate(60); S.code = code; S.codeQuery = ''; S.packIdx = 0; S.qty = ''; render(); if (lookup(code)) setTimeout(() => $('#qtyIn')?.focus(), 80); }
 
 /* ---------- イベント ---------- */
 const ACTIONS = {
-  camOpen: () => Cam.open(), camClose: () => Cam.close(), register: () => register(),
+  camOpen: () => Cam.open(), camClose: () => Cam.close(), photoScan: () => Cam.photo(), reloadApp: () => location.reload(), register: () => register(),
   export: () => exportCounts(),
   clearSession: () => { if (S.armed !== 'clear') { S.armed = 'clear'; return render(); } const n = sessionLog().length; saveLog(log().filter(e => e.Session !== S.session)); S.exportInfo = null; LS.del('f_export'); S.armed = null; toast(`${n}件をこの端末から消しました`); render(); },
   masterFromScan: () => openEdit(S.code.trim(), !master()[S.code.trim()]),
@@ -11078,7 +11155,7 @@ const ACTIONS = {
   genFetch: async () => { busy('GENから取得中…'); S.imp.err = ''; try { S.imp.text = await fetchGenMaster(); S.imp.all = true; S.imp.preview = previewImport(); toast('GENから取得しました'); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } unbusy(); render(); },
   impPreview: () => { S.imp.err = ''; S.imp.text = $('#impText').value; try { S.imp.preview = previewImport(); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } render(); },
   impApply: () => { const p = S.imp.preview; if (!p) return; const s = applyImport(p); S.imp.preview = null; S.imp.text = ''; toast('反映しました: ' + s + '。他の端末に配るには「マスタCSVを書き出す」', 6000); go('master'); },
-  saveBasic: () => { S.session = $('#sesIn').value.trim(); S.user = { name: $('#nameIn').value.trim(), email: $('#mailIn').value.trim() }; LS.set('f_session', S.session); LS.set('f_user', S.user); S.exportInfo = null; LS.del('f_export'); S.agg.book = null; S.agg.result = null; toast('保存しました'); render(); },
+  saveBasic: () => { const ses = normSession($('#sesIn').value); if (!ses) return toast('棚卸回は「年-月」で入れてください(例 2026-11)', 4000); S.session = ses; S.user = { name: $('#nameIn').value.trim(), email: $('#mailIn').value.trim() }; LS.set('f_session', S.session); LS.set('f_user', S.user); S.exportInfo = null; LS.del('f_export'); S.agg.book = null; S.agg.result = null; toast('保存しました'); render(); },
   saveCfg: () => { document.querySelectorAll('[data-cfg]').forEach(el => S.cfg[el.dataset.cfg] = el.value.trim()); LS.set('f_cfg', S.cfg); const t = $('#genToken').value.trim(), keep = $('#genTokenKeep').checked; memToken = t; if (t && keep) LS.set('f_gen_token', t); else LS.del('f_gen_token'); toast(t ? (keep ? '保存しました(トークンはこの端末に保存)' : '保存しました(トークンはアプリを閉じると消えます)') : '保存しました'); render(); },
   aggPick: async () => { const fs = await pickFiles(); if (!fs.length) return; try { loadAggFiles(fs); } catch (e) { S.agg.err = e.message; } render(); },
   aggBookFile: async () => { const f = await pickFile(); if (!f) return; S.agg.bookText = f.text; S.agg.book = parseBook(f.text); if (S.agg.book.size && S.session) saveBook(S.agg.book, f.name); S.agg.result = null; S.agg.showBook = false; toast(`帳簿 ${S.agg.book.size}品目`); render(); },
@@ -11150,7 +11227,12 @@ if (!S.session || !S.user.name) S.screen = 'setting';
 render();
 // 端末にデータを残しやすくする(対応ブラウザのみ。ホーム画面のアプリでは許可されやすい)
 if (navigator.storage && navigator.storage.persist) navigator.storage.persisted().then(p => p || navigator.storage.persist()).then(ok => { LS.set('f_persist', !!ok); }).catch(() => {});
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  // 差し替え後: 新しい sw.js が有効になったら(=新しい版が端末に届いたら)「開き直す」を出す。初めて開いた時は出さない
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !S.updateReady) { S.updateReady = true; render(); } });
+  navigator.serviceWorker.register('sw.js').then(r => r.update()).catch(() => {});
+}
 </script>
 </body>
 </html>
