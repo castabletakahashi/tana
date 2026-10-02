@@ -125,6 +125,7 @@ nav.tabs .badge{position:absolute;top:6px;right:calc(50% - 22px);background:var(
 #cam .frame{position:absolute;left:50%;top:42%;width:64vmin;height:64vmin;transform:translate(-50%,-50%);border:3px solid var(--signal);pointer-events:none}
 #cam .ctl{padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:#000;display:flex;gap:10px}
 #cam .msg{position:absolute;top:calc(16px + env(safe-area-inset-top));left:0;right:0;text-align:center;color:#fff;font-weight:700}
+#cam .info{position:absolute;top:calc(42px + env(safe-area-inset-top));left:0;right:0;text-align:center;color:#ccc;font-size:12px;padding:0 12px}
 .busy{position:fixed;inset:0;background:rgba(231,234,230,.8);z-index:25;display:flex;align-items:center;justify-content:center;font-weight:700}
 @media (prefers-reduced-motion:reduce){#toast{transition:none}}
 @media (min-width:900px){ .tag .code{font-size:52px} }
@@ -137,7 +138,8 @@ nav.tabs .badge{position:absolute;top:6px;right:calc(50% - 22px);background:var(
   <video id="camVideo" playsinline webkit-playsinline muted autoplay></video>
   <div class="frame"></div>
   <div class="msg" id="camMsg">QRコードを枠に入れてください</div>
-  <div class="ctl"><button class="btn big" data-act="photoScan" style="flex:1">写真で読む</button><button class="btn big" data-act="camClose" style="flex:1">閉じる</button></div>
+  <div class="info" id="camInfo"></div>
+  <div class="ctl"><button class="btn big" data-act="photoScan" style="flex:1">写真で読む</button><button class="btn big" data-act="camSwitch" style="flex:1">カメラ切替</button><button class="btn big" data-act="camClose" style="flex:1">閉じる</button></div>
 </div>
 <canvas id="camCanvas" hidden></canvas>
 <input type="file" id="photoIn" accept="image/*" capture="environment" hidden>
@@ -10258,7 +10260,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-2.8';
+const APP_VERSION = 'file-3.0';
 const APP_VERSION_LABEL = 'v' + APP_VERSION.replace(/^file-/, '');   // 画面の右上に出す版数(例 v2.8)
 /* 品目マスタ(埋め込みなし) */
 const MASTER_SEED = [];   // v2.2: 品目マスタは埋め込まない(公開URLに品名・得意先名を載せないため)。初回に「マスタCSVを読み込む」
@@ -10269,6 +10271,15 @@ const MLOG_COLS = ['Title','ItemCode','Action','Changes','GenFields','GenStatus'
 /* マスタ変更CSV(端末で新規登録・変更した品目を管理者のPCへ渡す。カウントCSVと一緒に書き出す) */
 const MCHG_KIND = 'マスタ変更';
 const MCHG_COLS = ['Kind', ...MASTER_COLS, 'Changes', 'GenFields', 'ActionBy', 'ActionByEmail', 'ActionAt'];
+/* v3.0 差異の修正(再修正モード)
+   ・管理者のPC: 集計の後、直す品目を選んで「再修正データ」(再修正依頼CSV)を書き出す。数量・帳簿は入れない(数を見ずに数え直すため)
+   ・再カウント担当の端末: 再修正データを読み込み、再修正モードで数え直す。明細は EntryType=recount・Round=第n回 として追加(元の明細は残す)
+   ・集計: 品目ごとに「いちばん新しい回」の明細だけを合計して実在庫にする(=再修正した品目は修正後の数に置き換わる)
+   ・PCで直接直すこともできる(理由は必須)。PCの修正はこのPCに保存し、差異修正記録CSVに書き出す(読み込めば戻せる) */
+const RC_KIND = '再修正依頼';
+const RC_COLS = ['Kind', 'Session', 'ItemCode', 'ItemName', 'Spec', 'Unit', 'Round', 'Locations', 'RequestedBy', 'RequestedAt'];
+const REC_KIND = '差異修正記録';
+const REC_COLS = ['Kind', 'Session', 'ItemCode', 'ItemName', 'Unit', 'BookQty', 'FirstQty', 'FinalQty', 'DiffQty', 'Status', 'Method', 'Round', 'Reason', 'FixedBy', 'FixedAt', 'ToGen'];
 
 /* ---------- 小道具 ---------- */
 const $ = s => document.querySelector(s);
@@ -10385,6 +10396,8 @@ function pickFile() { return new Promise(res => { const i = $('#fileIn'); i.valu
 
 /* ---------- 端末内データ ---------- */
 const DEFAULT_REASONS = '数え間違い;記録漏れ;置き場の見落とし;破損・廃棄;入出庫の計上タイミング;単位・荷姿の誤り;その他';
+// v3.0: 差異の修正を入れたので、帳簿と差がある品目は既定でGEN取込に出さない(確定してから出す)。前の版で保存した設定も1回だけ切り替える
+if (!LS.get('f_agg_v3', false)) { const o = LS.get('f_agg_opt', null); if (o) { o.incDiff = false; LS.set('f_agg_opt', o); } LS.set('f_agg_v3', true); }
 const S = {
   screen: 'scan',
   user: LS.get('f_user', { name: '', email: '' }),
@@ -10396,8 +10409,10 @@ const S = {
   imp: { text: '', all: false, newTarget: false, preview: null, err: '' },
   exportInfo: LS.get('f_export', null),   // {at, n, name}
   bookUi: { text: '', show: false, err: '' },
-  agg: { files: [], rows: [], mchg: [], bookText: '', book: null, result: null, filter: 'すべて', err: '',
-         opt: { date: '', loc: '0000000000000', incDiff: true, zeroUncounted: false, enc: 'sjis', ...LS.get('f_agg_opt', {}) } },
+  agg: { files: [], rows: [], mchg: [], bookText: '', book: null, result: null, filter: 'すべて', err: '', open: '', adjForm: false,
+         opt: { date: '', loc: '0000000000000', incDiff: false, zeroUncounted: false, enc: 'sjis', ...LS.get('f_agg_opt', {}) } },
+  rcMode: LS.get('f_rc_mode', false),   // 再修正モード(再カウント担当の端末)
+  rcReason: {},                         // 再修正で選んだ理由 {品目コード: 理由}
 };
 function seedCfg() { const c = {}; for (const a of CONFIG_SEED) c[a[0]] = a[1]; return c; }
 if (!Object.keys(S.cfg).length) { S.cfg = seedCfg(); LS.set('f_cfg', S.cfg); }
@@ -10419,6 +10434,25 @@ function packs(it) {
 }
 const sessionLog = () => log().filter(e => e.Session === S.session);
 const unexported = () => { const at = S.exportInfo?.at || ''; return sessionLog().filter(e => !at || e.ScannedAt > at); };
+/* v3.0 再修正 */
+const reasonList = () => String(cfgVal('Reasons', DEFAULT_REASONS)).split(';').map(s => s.trim()).filter(Boolean);
+const voidedIds = rows => new Set(rows.filter(e => e.EntryType === 'void').map(e => String(e.Note || '').replace('取消:', '')));
+const roundOf = e => num(e.Round) || 1;
+const reasonOf = e => String(e.Note || '').startsWith('理由:') ? String(e.Note).slice(3) : '';
+// 再カウント担当の端末: 読み込んだ再修正データ {棚卸回: {name, at, by, items:[{code,name,spec,unit,round,locs}]}}
+const rcStore = () => LS.get('f_rc', {});
+const rcReq = (ses = S.session) => { const r = rcStore()[ses]; return r && r.items && r.items.length ? r : null; };
+const rcItem = code => { const r = rcReq(); return r ? r.items.find(i => i.code === code) || null : null; };
+const rcOn = () => !!(S.rcMode && rcReq());
+function rcRows(code, round) { const L = sessionLog(), vd = voidedIds(L); return L.filter(e => e.ItemCode === code && e.EntryType === 'recount' && roundOf(e) === round && !vd.has(e.Title)); }
+const rcLeft = () => { const r = rcReq(); return r ? r.items.filter(i => !rcRows(i.code, i.round).length).length : 0; };
+// 管理者のPC: 再修正の依頼 {棚卸回: {品目コード: {round, at}}} と PCでの修正 {棚卸回: {品目コード: {qty, reason, by, at}}}
+const reqStore = () => LS.get('f_rcreq', {});
+const reqOf = () => reqStore()[S.session] || {};
+function saveReq(o) { const all = reqStore(); all[S.session] = o; LS.set('f_rcreq', all); }
+const adjStore = () => LS.get('f_adj', {});
+const adjOf = () => adjStore()[S.session] || {};
+function saveAdj(o) { const all = adjStore(); all[S.session] = o; LS.set('f_adj', all); }
 
 /* ---------- 登録・取消・書き出し ---------- */
 function register() {
@@ -10426,17 +10460,21 @@ function register() {
   if (!S.session) return toast('先に設定で棚卸回を入れてください');
   if (!S.user.name) return toast('先に設定で担当者の名前を入れてください');
   if (!it) return toast('マスタにない品目は登録できません');
+  const rc = rcItem(code);   // v3.0: 再修正の対象なら「第n回」の再修正として登録する
+  if (rc && !rcOn()) return toast('この品目は再修正の対象です。「再修正」画面で再修正モードを始めてから登録してください', 4500);
+  if (!rc && rcOn()) return toast('再修正モード中です。再修正の対象ではない品目は登録できません(「再修正」画面でモードを終えると普段の登録に戻ります)', 5000);
   const q = num(S.qty); if (q == null || q < 0) return toast('数量を入力してください');
   const p = packs(it)[S.packIdx] || packs(it)[0];
+  const rs = rc ? (S.rcReason[code] || '') : '';
   const e = { Title: uuid(), Session: S.session, ItemCode: code, ItemName: it.ItemName, Location: S.loc.trim(), InputQty: q, PackName: p.n, Factor: p.f, Qty: rnd(q * p.f),
-    EntryType: 'count', Round: 1, Counter: S.user.name, CounterEmail: S.user.email || '', ScannedAt: nowIso(), Note: '', AppVersion: APP_VERSION };
+    EntryType: rc ? 'recount' : 'count', Round: rc ? rc.round : 1, Counter: S.user.name, CounterEmail: S.user.email || '', ScannedAt: nowIso(), Note: rs ? '理由:' + rs : '', AppVersion: APP_VERSION };
   saveLog(log().concat(e)); LS.set('f_lastloc', S.loc);
   if (navigator.vibrate) navigator.vibrate(40);
-  toast(`登録しました ${fmtN(e.Qty)}${it.Unit || ''}`);
+  toast(rc ? `再修正を登録しました ${fmtN(e.Qty)}${it.Unit || ''}(残り ${rcLeft()}品目)` : `登録しました ${fmtN(e.Qty)}${it.Unit || ''}`);
   S.code = ''; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; render();
 }
 function voidEntry(id) {
-  const o = log().find(e => e.Title === id); if (!o || o.EntryType !== 'count') return;
+  const o = log().find(e => e.Title === id); if (!o || !['count', 'recount'].includes(o.EntryType)) return;
   if (log().some(e => e.Note === '取消:' + id)) return toast('すでに取り消しています');
   saveLog(log().concat({ ...o, Title: uuid(), InputQty: -o.InputQty, Qty: -o.Qty, EntryType: 'void', ScannedAt: nowIso(), Note: '取消:' + id, AppVersion: APP_VERSION }));
   S.armed = null; toast('取り消しました'); render();
@@ -10454,7 +10492,7 @@ function localMasterChanges() {
 async function exportCounts() {
   const rows = sessionLog();
   if (!rows.length) return toast('この棚卸回の登録はまだありません');
-  const tag = `${fileSafe(S.session)}_${fileSafe(S.user.name || '担当者')}_${stamp()}`;
+  const tag = `${fileSafe(S.session)}_${fileSafe(S.user.name || '担当者')}${rows.some(e => e.EntryType === 'recount') ? '_再修正' : ''}_${stamp()}`;
   const files = [{ name: `棚卸_${tag}.csv`, text: csv(COUNT_COLS, rows.map(e => COUNT_COLS.map(c => e[c]))) }];
   const mc = localMasterChanges();
   if (mc.length) files.push({ name: `マスタ変更_${tag}.csv`, text: csv(MCHG_COLS, mc.map(({ it, l }) => [MCHG_KIND, ...MASTER_COLS.map(c => it[c]), l.Changes, toBool(l.GenFields), l.ActionBy, l.ActionByEmail, l.ActionAt])) });
@@ -10559,8 +10597,11 @@ async function importMasterFile() {
   const f = await pickFile(); if (!f) return;
   const rows = parseDelimited(f.text); if (rows.length < 2) throw new Error('データがありません');
   const h = rows[0].map(s => s.trim()); const ix = {}; MASTER_COLS.forEach(c => ix[c] = h.indexOf(c));
+  if (h.includes('Kind')) { const k = String(rows[1][h.indexOf('Kind')] || '').trim();
+    if (k === RC_KIND) throw new Error('これは「再修正データ」です。「再修正」画面(設定 →「再修正データを読み込む」)で読み込んでください');
+    if (k === REC_KIND) throw new Error('これは「差異修正記録CSV」です。管理者のPCの「集計」画面で、カウントCSVと一緒に選んでください');
+    throw new Error('これは「マスタ変更CSV」です。管理者のPCの「集計」画面で読み込んでください'); }
   if (ix.Title < 0 || ix.ItemName < 0) throw new Error('品目マスタCSVの形式ではありません(Title・ItemName の列が必要)');
-  if (h.includes('Kind')) throw new Error('これは「マスタ変更CSV」です。管理者のPCの「集計」画面で読み込んでください');
   const local = master(), lastChange = new Map();
   for (const l of mlog()) if (['新規', '変更'].includes(l.Action) && l.GenStatus !== '引継ぎ済') lastChange.set(l.ItemCode, l.ActionAt);
   const m = {}; let n = 0, kept = 0, merged = 0, removed = 0;
@@ -10631,7 +10672,12 @@ function loadAggFiles(files) {
   for (const f of files) {
     if (!/\.csv$/i.test(f.name)) { skipped.push(f.name); continue; }
     const head = (parseDelimited(String(f.text).split(/\r?\n/)[0] || '')[0] || []).map(x => x.trim());
-    if (head[0] === 'Kind') { const r = parseMchgCsv(f); mch.push(...r); names.push({ name: f.name, n: r.length, counters: [...new Set(r.map(x => x.ActionBy))].join('、'), session: '', kind: 'マスタ変更' }); continue; }
+    if (head[0] === 'Kind') {
+      const kind = String((parseDelimited(f.text)[1] || [])[0] || '').trim();
+      if (kind === RC_KIND) { skipped.push(f.name); continue; }   // 再修正データ(依頼)は集計に使わない
+      if (kind === REC_KIND) { const n = restoreAdjFromRecord(f); names.push({ name: f.name, n, counters: '', session: '', kind: '差異修正記録' }); continue; }
+      const r = parseMchgCsv(f); mch.push(...r); names.push({ name: f.name, n: r.length, counters: [...new Set(r.map(x => x.ActionBy))].join('、'), session: '', kind: 'マスタ変更' }); continue;
+    }
     if (!head.includes('ItemCode') || !head.includes('Qty')) { skipped.push(f.name); continue; }   // 品目マスタCSVなど、集計に関係ないファイルは読み飛ばす
     const rows = parseCountCsv(f); all.push(...rows); names.push({ name: f.name, n: rows.length, counters: [...new Set(rows.map(r => r.Counter))].join('、'), session: rows[0]?.Session || '', kind: 'カウント' });
   }
@@ -10643,24 +10689,62 @@ function loadAggFiles(files) {
   if (sessions.length > 1) A.err = `棚卸回が混ざっています(${sessions.join(' / ')})。設定の棚卸回「${S.session}」の分だけを集計します`;
   if (!uniq.some(r => r.Session === S.session)) A.err = `選んだCSVに棚卸回「${S.session}」の明細がありません。設定の棚卸回を確認してください(CSVの棚卸回: ${sessions.join(' / ') || 'なし'})`;
 }
+/* 集計(v3.0): 取消した明細を除き、品目ごとに「いちばん新しい回(Round)」の明細だけを合計する。
+   再修正(第2回以降)がある品目は、修正後の数に置き換わる(初回の明細は記録として残すが、数には入れない)。
+   PCで直した品目は、その数を使う(いちばん優先)。状態:
+   未カウント / 帳簿なし / 差異なし / 差異あり / 再修正中(依頼したが、まだ数が届いていない) / 修正済 / 修正済・差異あり */
 function runAgg() {
   const A = S.agg, rows = A.rows.filter(r => r.Session === S.session);
-  const book = A.book || new Map(), m = master();
-  const agg = new Map();
+  const book = A.book || new Map(), m = master(), req = reqOf(), adj = adjOf();
+  const vd = voidedIds(rows), by = new Map(), voids = new Map();
   for (const r of rows) {
-    const a = agg.get(r.ItemCode) || { qty: 0, n: 0, v: 0, who: new Set(), loc: new Set(), name: r.ItemName };
-    a.qty = rnd(a.qty + r.Qty); if (r.EntryType === 'void') a.v++; else a.n++; if (r.Counter) a.who.add(r.Counter); if (r.Location) a.loc.add(r.Location); agg.set(r.ItemCode, a);
+    if (r.EntryType === 'void') { voids.set(r.ItemCode, (voids.get(r.ItemCode) || 0) + 1); continue; }
+    if (vd.has(r.Title)) continue;
+    if (!by.has(r.ItemCode)) by.set(r.ItemCode, []); by.get(r.ItemCode).push(r);
   }
-  const codes = new Set([...agg.keys(), ...[...book.values()].filter(b => b.qty !== 0).map(b => b.code)]);
-  const out = [];
+  const sum = list => rnd(list.reduce((s, r) => s + (r.Qty || 0), 0));
+  const uniq = (list, f) => [...new Set(list.map(f).filter(Boolean))].join('、');
+  const codes = new Set([...by.keys(), ...[...book.values()].filter(b => b.qty !== 0).map(b => b.code), ...Object.keys(adj)]);
+  const out = []; let late = 0;
   for (const code of codes) {
-    const a = agg.get(code), b = book.get(code), it = m[code];
-    const bookQty = b ? b.qty : 0, qty = a ? a.qty : 0, diff = rnd(qty - bookQty);
-    const st = !a ? '未カウント' : !b ? '帳簿なし' : diff === 0 ? '差異なし' : '差異あり';
-    out.push({ code, name: b?.name || it?.ItemName || a?.name || '', unit: b?.unit || it?.Unit || '', book: bookQty, qty, diff, st, inBook: !!b, n: a ? a.n : 0, v: a ? a.v : 0, who: a ? [...a.who].join('、') : '', loc: a ? [...a.loc].join('、') : '' });
+    const list = by.get(code) || [], b = book.get(code), it = m[code], a = adj[code], rq = req[code];
+    const maxR = list.length ? Math.max(...list.map(roundOf)) : 0;
+    const latest = list.filter(r => roundOf(r) === maxR), first = list.filter(r => roundOf(r) === 1);
+    const rcAt = maxR > 1 ? latest.map(r => r.ScannedAt).sort()[0] : '';
+    const lateN = maxR > 1 ? list.filter(r => roundOf(r) < maxR && r.ScannedAt > rcAt).length : 0; late += lateN;
+    const devQty = sum(latest), bookQty = b ? b.qty : 0;
+    let qty = devQty, method = maxR > 1 ? `再修正 第${maxR}回` : '', reason = maxR > 1 ? uniq(latest, reasonOf) : '';
+    let fixedBy = maxR > 1 ? uniq(latest, r => r.Counter) : '', fixedAt = maxR > 1 ? latest.map(r => r.ScannedAt).sort().pop() : '', warn = '';
+    if (a) {
+      method = maxR > 1 && a.qty === devQty ? `再修正 第${maxR}回(理由はPCで入力)` : 'PCで修正';
+      if (maxR > 1 && fixedAt > a.at) warn = 'PCで直した後に、再修正の登録が届いています(PCで直した数を使っています)';
+      qty = a.qty; reason = a.reason; fixedBy = a.by; fixedAt = a.at;
+    }
+    const diff = rnd(qty - bookQty), fixed = !!a || maxR > 1, pending = !!rq && rq.round > maxR && !a;
+    const st = pending ? '再修正中' : !b ? '帳簿なし' : (!list.length && !a) ? '未カウント'
+      : fixed ? (diff === 0 ? '修正済' : '修正済・差異あり') : (diff === 0 ? '差異なし' : '差異あり');
+    out.push({ code, name: b?.name || it?.ItemName || list[0]?.ItemName || '', unit: b?.unit || it?.Unit || '', book: bookQty, qty, first: sum(first), diff, st, inBook: !!b,
+      n: latest.length, v: voids.get(code) || 0, who: uniq(list, r => r.Counter), loc: uniq(latest, r => r.Location), loc1: uniq(first, r => r.Location),
+      round: maxR, method, reason, fixedBy, fixedAt, warn, late: lateN, req: rq ? rq.round : 0 });
   }
   out.sort((x, y) => Math.abs(y.diff) - Math.abs(x.diff) || x.code.localeCompare(y.code));
-  A.result = { rows: out, n: rows.length, at: nowIso() };
+  A.result = { rows: out, n: rows.length, at: nowIso(), late };
+}
+const reRunAgg = () => { if (S.agg.result) runAgg(); };
+/* 差異修正記録CSV から、PCで直した内容を戻す(このPCのデータが消えた時・別のPCで続ける時)。このPCにすでにある修正は上書きしない */
+function restoreAdjFromRecord(file) {
+  const rows = parseDelimited(file.text); if (rows.length < 2) return 0;
+  const h = rows[0].map(x => x.trim()), ix = {}; REC_COLS.forEach(c => ix[c] = h.indexOf(c));
+  const adj = adjOf(); let n = 0;
+  for (const r of rows.slice(1)) {
+    const g = c => ix[c] >= 0 ? String(r[ix[c]] ?? '').trim() : '';
+    const pc = g('Method').startsWith('PCで修正') || g('Method').includes('理由はPCで入力');
+    if (g('Kind') !== REC_KIND || g('Session') !== S.session || !pc) continue;
+    const code = g('ItemCode'), q = num(g('FinalQty')); if (!code || q == null || adj[code]) continue;
+    adj[code] = { qty: q, reason: g('Reason'), by: g('FixedBy'), at: g('FixedAt') || nowIso() }; n++;
+  }
+  if (n) saveAdj(adj);
+  return n;
 }
 /* あいまい検索(v2.4): 全角/半角・ひらがな/カタカナ・大文字/小文字・空白/記号/長音/小さい文字の違いを無視し、
    複数の語は AND。語がそのまま含まれなければ、3文字以上の語は飛び飛びの一致(例 ｷｭﾎﾟﾗﾑ → キューポラム)も候補にする */
@@ -10728,7 +10812,13 @@ function saveBook(map, name) {
 function clearBook() { const all = bookStore(); delete all[S.session]; LS.set('f_book', all); }
 /* 帳簿にある(帳簿が0以外)のに、品目マスタにない・棚卸対象外で、QRを読んでも登録できない品目 */
 function bookNotCountable(map) { const m = master(); return [...map.values()].filter(b => b.qty !== 0 && !(m[b.code] && m[b.code].CountTarget)).map(b => ({ ...b, why: m[b.code] ? '棚卸対象外' : 'マスタにない' })); }
-const aggOut = r => { const o = S.agg.opt; return r.inBook && (r.st === '差異なし' || (r.st === '差異あり' && o.incDiff) || (r.st === '未カウント' && o.zeroUncounted)); };
+/* GEN取込に出す品目(v3.0): 帳簿にあって、差異なし・修正済、または 修正済・差異あり で理由がある品目。
+   差異あり(まだ直していない)は設定でオンにした時だけ、未カウントは「0で出力」をオンにした時だけ。再修正中は出さない */
+const aggOut = r => { const o = S.agg.opt; return r.inBook && (r.st === '差異なし' || r.st === '修正済' || (r.st === '修正済・差異あり' && !!r.reason) || (r.st === '差異あり' && o.incDiff) || (r.st === '未カウント' && o.zeroUncounted)); };
+const needWhy = r => r.st === '再修正中' ? `再修正の数が届くのを待っています(第${r.req}回)`
+  : r.st === '修正済・差異あり' && !r.reason ? '修正後も帳簿と差があります。理由を入れると GEN取込に出ます(「数を直す・確定」)'
+  : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : r.st === '未カウント' ? '数えていない。再修正に入れるか、在庫0なら設定で0出力'
+  : r.st === '差異あり' ? '帳簿と差がある。再修正に入れるか、「数を直す・確定」で確定' : '';
 
 /* ---------- 画面 ---------- */
 const ICON = {
@@ -10737,6 +10827,7 @@ const ICON = {
   out: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 8l5-5 5 5"/><path d="M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg>',
   mst: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg>',
   set: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>',
+  rc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v5h-5"/><path d="M9 12l2 2 4-4"/></svg>',
 };
 function bar(title) {
   const n = unexported().length;
@@ -10744,7 +10835,8 @@ function bar(title) {
     ? `<div class="note" style="margin:8px 16px 0">Safari で開いています。<b>カウントはホーム画面の「棚卸カウント」から起動してください。</b>iPhone では Safari とホーム画面のアプリはデータが別々で、こちらには登録・品目マスタが入っていません。</div>` : '';
   const upd = S.updateReady
     ? `<div class="note" style="margin:8px 16px 0">新しい版のアプリが届きました。<button class="btn sm primary" data-act="reloadApp">開き直す</button>(登録した明細は消えません)</div>` : '';
-  return `<header class="bar"><h1>${esc(title)}</h1><span class="ver" title="アプリの版数">${esc(APP_VERSION_LABEL)}</span><span class="queue ${n ? 'has' : ''}">未書き出し: ${n}件</span></header>${upd}${warn}`;
+  const rcm = rcOn() ? `<div class="err" style="margin:8px 16px 0"><b>再修正モード中</b>(残り ${rcLeft()} / ${rcReq().items.length}品目)。対象の品目だけ登録できます。<button class="btn sm" data-go="recount">再修正の一覧</button></div>` : '';
+  return `<header class="bar"><h1>${esc(title)}</h1><span class="ver" title="アプリの版数">${esc(APP_VERSION_LABEL)}</span><span class="queue ${n ? 'has' : ''}">未書き出し: ${n}件</span></header>${upd}${warn}${rcm}`;
 }
 /* 読取画面に出す注意(設定・マスタの未読込・書き出し忘れ) */
 // 棚卸回は「年-月」(yyyy-mm。例 2026-11)。全角・「2026/11」「202611」「2026年11月」も受け付けて yyyy-mm にそろえる。形式外は ''
@@ -10758,6 +10850,7 @@ function notices() {
   const out = [];
   if (!S.session || !S.user.name) out.push(`棚卸回と担当者の名前を設定してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
   else if (!normSession(S.session)) out.push(`棚卸回「${esc(S.session)}」は古い形式です。設定で <b>年-月</b>(例 2026-11)に直してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
+  if (rcReq() && !S.rcMode && rcLeft()) out.push(`再修正の依頼が届いています(残り ${rcLeft()}品目)。<button class="btn sm" data-go="recount">再修正を開く</button>`);
   if (!masterCount()) out.push(`品目マスタが入っていません。管理者が Teams に置いた「品目マスタ_….csv」を読み込んでください。<button class="btn sm" data-act="masterIn">マスタCSVを読み込む</button>`);
   const u = unexported();
   if (u.length) {
@@ -10767,7 +10860,7 @@ function notices() {
   return out.map(s => `<div class="note">${s}</div>`).join('');
 }
 function tabs() {
-  const t = [['scan', '読取', ICON.scan], ['history', '履歴', ICON.hist], ['export', '書き出し', ICON.out, unexported().length], ['master', 'マスタ', ICON.mst], ['setting', '設定', ICON.set]];
+  const t = [['scan', '読取', ICON.scan], ['history', '履歴', ICON.hist], ['export', '書き出し', ICON.out, unexported().length], ...(rcReq() ? [['recount', '再修正', ICON.rc, rcLeft()]] : []), ['master', 'マスタ', ICON.mst], ['setting', '設定', ICON.set]];
   const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting' }[S.screen] || S.screen;
   return `<nav class="tabs" aria-label="画面"><div class="in">${t.map(([k, l, ic, b]) => `<button data-go="${k}" ${cur === k ? 'aria-current="page"' : ''}>${ic}${b ? `<span class="badge">${b}</span>` : ''}<span>${l}</span></button>`).join('')}</div></nav>`;
 }
@@ -10775,13 +10868,18 @@ function scrScan() {
   const code = S.code.trim(), it = code ? lookup(code) : null, unknown = code && !it;
   const ps = it ? packs(it) : [], p = ps[S.packIdx] || ps[0];
   const conv = it && num(S.qty) != null && p && p.f !== 1 ? `= ${fmtN(rnd(num(S.qty) * p.f))} ${esc(it.Unit || '')}` : '';
-  const mine = code ? sessionLog().filter(e => e.ItemCode === code) : [];
+  const rc = it ? rcItem(code) : null, rcm = rcOn();
+  const mine = !code ? [] : rc ? rcRows(code, rc.round) : sessionLog().filter(e => e.ItemCode === code);
   const sum = rnd(mine.reduce((s, e) => s + e.Qty, 0));
   const locs = [...new Set(log().map(e => e.Location).filter(Boolean))].slice(-20);
   let cls = 'tag', body;
-  if (!code) { cls += ' empty'; body = `<div class="code">QRを読む</div><div class="sub">カメラで読むか、品目コードを入力してください</div>`; }
+  if (!code) { cls += ' empty'; body = `<div class="code">QRを読む</div><div class="sub">${rcm ? '再修正の対象の品目を読んでください' : 'カメラで読むか、品目コードを入力してください'}</div>`; }
   else if (unknown) { cls += ' unknown'; body = `<div class="code">${esc(code)}</div><span class="flag ng">マスタ未登録(または棚卸対象外)</span><div style="margin-top:10px"><button class="btn sm" data-act="masterFromScan">マスタを確認・登録</button></div>`; }
-  else body = `<div class="code">${esc(code)}</div><div class="name">${esc(it.ItemName)}</div><div class="sub">[${esc(it.Category || '分類なし')}] ${esc(it.Spec)}${it.Unit ? '(' + esc(it.Unit) + ')' : ''}</div>`;
+  else {
+    if (rc) cls += ' recount'; else if (rcm) cls += ' unknown';
+    body = `<div class="code">${esc(code)}</div><div class="name">${esc(it.ItemName)}</div><div class="sub">[${esc(it.Category || '分類なし')}] ${esc(it.Spec)}${it.Unit ? '(' + esc(it.Unit) + ')' : ''}</div>`
+      + (rc ? `<span class="flag ng" style="background:var(--signal);color:var(--ink)">再修正 第${rc.round}回</span>${!rcm ? `<div style="margin-top:8px"><button class="btn sm primary" data-act="rcStart">再修正モードを始める</button></div>` : ''}` : rcm ? '<span class="flag ng">再修正の対象外</span>' : '');
+  }
   return bar(S.session || '棚卸回が未設定') + `<main>
     ${notices()}
     <div class="${cls}">${body}</div>
@@ -10795,11 +10893,14 @@ function scrScan() {
     ${ps.length > 1 || it.Packs ? `<div class="field"><label for="packSel">荷姿</label><select id="packSel">${ps.map((x, i) => `<option value="${i}" ${i === S.packIdx ? 'selected' : ''}>${esc(x.n)}${x.f !== 1 ? '(×' + fmtN(x.f) + ')' : ''}</option>`).join('')}</select></div>` : ''}
     <div class="field"><label for="qtyIn">数量${p && p.f !== 1 ? '(' + esc(p.n) + 'の数)' : (it.Unit ? '(' + esc(it.Unit) + ')' : '')}</label>
       <input type="text" inputmode="decimal" id="qtyIn" class="qty" value="${esc(S.qty)}" placeholder="0" autocomplete="off" enterkeyhint="done"><div class="conv" id="conv">${conv}</div></div>
-    <div class="field"><label for="locIn">置き場(任意・次回も残ります)</label>
+    <div class="field"><label for="locIn">置き場(任意。本社倉庫内の棚の名前など。空欄でよい・次回も残ります)</label>
       <input type="text" id="locIn" list="locList" value="${esc(S.loc)}" autocomplete="off"><datalist id="locList">${locs.map(l => `<option value="${esc(l)}">`).join('')}</datalist></div>
-    <button class="btn primary big block" style="margin-top:16px" data-act="register">登録</button>
-    <div class="ref">参考: この端末でのこの品目の合計 <b>${fmtN(sum)}</b> ${esc(it.Unit || '')} <span class="muted">(${mine.filter(e => e.EntryType === 'count').length}件)</span><br>
-      <span class="muted small">同じ製品を何回登録しても大丈夫です。全員分の合計は、管理者がこのアプリの「集計」画面で行います。</span></div>` : ''}
+    ${rc ? `<div class="field"><label for="rcReason">差が出た理由(わかれば・任意)</label><select id="rcReason"><option value="">(選ばない)</option>${reasonList().map(x => `<option ${S.rcReason[code] === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div>` : ''}
+    <button class="btn primary big block" style="margin-top:16px" data-act="register" ${(rc && !rcm) || (!rc && rcm) ? 'disabled' : ''}>${rc ? '再修正として登録' : '登録'}</button>
+    ${rc ? `<div class="ref">この品目の再修正の合計(第${rc.round}回) <b>${fmtN(sum)}</b> ${esc(it.Unit || '')} <span class="muted">(${mine.length}件)</span><br>
+      <span class="muted small"><b>本社倉庫内のこの品目を全部数え直して</b>登録します。置き場ごとに分けて何回登録しても合計されます。見つからなければ 0 で登録します。${rc.locs ? `前回の置き場(参考): ${esc(rc.locs)}` : ''}</span></div>`
+    : `<div class="ref">参考: この端末でのこの品目の合計 <b>${fmtN(sum)}</b> ${esc(it.Unit || '')} <span class="muted">(${mine.filter(e => e.EntryType === 'count').length}件)</span><br>
+      <span class="muted small">同じ製品を何回登録しても大丈夫です。全員分の合計は、管理者がこのアプリの「集計」画面で行います。</span></div>`}` : ''}
   </main>`;
 }
 function scrHistory() {
@@ -10809,12 +10910,56 @@ function scrHistory() {
     <p class="muted">${esc(S.session)} で、この端末から登録した明細です。取消はマイナスの行として記録され、CSVにも入ります。</p>
     ${rows.length ? `<div class="list">${rows.map(e => { const v = e.EntryType === 'void', done = voided.has(e.Title), u = master()[e.ItemCode]?.Unit || '';
       return `<div class="item ${v || done ? 'old' : ''}" style="cursor:default"><div class="main">
-        <div><span class="c">${esc(e.ItemCode)}</span> ${at && e.ScannedAt <= at ? '<span class="pill ok">書き出し済</span>' : '<span class="pill warn">未書き出し</span>'} ${v ? '<span class="pill bad">取消行</span>' : ''}${done ? '<span class="pill">取消済</span>' : ''}</div>
+        <div><span class="c">${esc(e.ItemCode)}</span> ${at && e.ScannedAt <= at ? '<span class="pill ok">書き出し済</span>' : '<span class="pill warn">未書き出し</span>'} ${v ? '<span class="pill bad">取消行</span>' : ''}${done ? '<span class="pill">取消済</span>' : ''}${roundOf(e) > 1 ? ` <span class="pill warn">再修正 第${roundOf(e)}回</span>` : ''}${reasonOf(e) ? ` <span class="pill">${esc(reasonOf(e))}</span>` : ''}</div>
         <div class="small">${esc(e.ItemName)}</div><div class="muted small">${fmtT(e.ScannedAt)}${e.Location ? '・' + esc(e.Location) : ''}</div></div>
         <div style="text-align:right"><div class="n">${e.Factor !== 1 ? `${fmtN(e.InputQty)} × ${esc(e.PackName)} = ${fmtN(e.Qty)}` : fmtN(e.Qty)} ${esc(u)}</div>
         ${!v && !done ? `<button class="btn danger sm ${S.armed === e.Title ? 'armed' : ''}" data-void="${esc(e.Title)}" style="margin-top:6px">${S.armed === e.Title ? 'もう一度押すと取消' : '取消'}</button>` : ''}</div></div>`; }).join('')}</div>`
     : '<p class="muted">まだ登録はありません。</p>'}
   </main>`;
+}
+/* 再修正(v3.0・再カウント担当の端末): 管理者から届いた再修正データを読み込み、対象の品目だけを数え直す */
+function scrRecount() {
+  const r = rcReq(), on = rcOn();
+  if (!r) return bar('再修正') + `<main>
+    <p>管理者が、集計で帳簿と差があった品目などを「<b>再修正データ</b>」(<code>再修正_${esc(S.session || '棚卸回')}_….csv</code>)にして Teams に置きます。それを読み込むと、対象の品目だけを数え直す「再修正モード」になります。</p>
+    <button class="btn primary big block" data-act="rcLoad">再修正データを読み込む</button>
+    <p class="muted small">棚卸回(${esc(S.session || '未設定')})が再修正データと同じであることが必要です。</p>
+  </main>`;
+  const items = r.items.map(i => { const rows = rcRows(i.code, i.round); return { ...i, n: rows.length, qty: rnd(rows.reduce((s, e) => s + e.Qty, 0)) }; });
+  const left = items.filter(i => !i.n).length, m = master();
+  return bar('再修正') + `<main>
+    <div class="kv"><div><span>対象</span><b>${items.length}</b></div><div><span>済</span><b>${items.length - left}</b></div><div><span>残り</span><b>${left}</b></div></div>
+    <p class="muted small" style="margin-top:6px">${esc(r.name)}(${esc(r.by || '管理者')}・${fmtT(r.at)})</p>
+    <button class="btn ${on ? '' : 'primary'} big block" data-act="${on ? 'rcEnd' : 'rcStart'}">${on ? '再修正モードを終える' : '再修正モードを始める'}</button>
+    <div class="note"><b>数え方</b>: 品目をタップ(またはQRを読む)→ <b>本社倉庫内のその品目を全部数え直して</b>登録します。置き場ごとに分けて登録すれば合計されます(置き場の入力は任意)。見つからなければ <b>0</b> で登録します。前回の数・帳簿の数は表示しません。終わったら「書き出し」でCSVを書き出して Teams に保存します。</div>
+    ${!left ? `<div class="panel"><b>全部の品目を数え直しました。</b>「書き出し」→「CSVを書き出す」で保存してください。<button class="btn primary block" data-go="export" style="margin-top:8px">書き出しへ</button></div>` : ''}
+    <div class="list">${items.map(i => `<button class="item" data-rcpick="${esc(i.code)}"><div class="main">
+      <div><span class="c">${esc(i.code)}</span> ${i.n ? '<span class="pill ok">済</span>' : '<span class="pill warn">未</span>'} <span class="pill">第${i.round}回</span></div>
+      <div class="small">${esc(i.name || m[i.code]?.ItemName || '')}</div>
+      ${i.locs ? `<div class="muted small">前回の置き場(参考): ${esc(i.locs)}</div>` : ''}</div>
+      <div class="n">${i.n ? `${fmtN(i.qty)} ${esc(i.unit || m[i.code]?.Unit || '')}<div class="muted small">${i.n}件</div>` : ''}</div></button>`).join('')}</div>
+    <div class="stack" style="margin-top:14px">
+      <button class="btn block" data-act="rcLoad">再修正データを読み込み直す</button>
+      <button class="btn danger block ${S.armed === 'rcClear' ? 'armed' : ''}" data-act="rcClear">${S.armed === 'rcClear' ? 'もう一度押すと消します' : 'この再修正データを端末から消す(登録した明細は残ります)'}</button>
+    </div>
+  </main>`;
+}
+async function loadRecountFile() {
+  const f = await pickFile(); if (!f) return false;
+  const rows = parseDelimited(f.text); if (rows.length < 2) throw new Error('データがありません');
+  const h = rows[0].map(x => x.trim()), ix = {}; RC_COLS.forEach(c => ix[c] = h.indexOf(c));
+  if (ix.Kind < 0 || ix.ItemCode < 0) throw new Error('再修正データの形式ではありません(管理者の「再修正データを書き出す」で作ったCSVを選んでください)');
+  const g = (r, c) => ix[c] >= 0 ? String(r[ix[c]] ?? '').trim() : '';
+  const list = rows.slice(1).filter(r => g(r, 'Kind') === RC_KIND && g(r, 'ItemCode'));
+  if (!list.length) throw new Error('再修正データではありません(Kind が「再修正依頼」の行がありません)');
+  const ses = [...new Set(list.map(r => g(r, 'Session')))];
+  if (!ses.includes(S.session)) throw new Error(`棚卸回が違います(再修正データ: ${ses.join(' / ')}・この端末: ${S.session || '未設定'})。設定の棚卸回を確認してください`);
+  const items = list.filter(r => g(r, 'Session') === S.session).map(r => ({ code: g(r, 'ItemCode'), name: g(r, 'ItemName'), spec: g(r, 'Spec'), unit: g(r, 'Unit'), round: num(g(r, 'Round')) || 2, locs: g(r, 'Locations') }));
+  const nm = items.filter(i => !lookup(i.code)).map(i => i.code);
+  const all = rcStore(); all[S.session] = { name: f.name, at: list.map(r => g(r, 'RequestedAt')).sort().pop() || nowIso(), by: g(list[0], 'RequestedBy'), items }; LS.set('f_rc', all);
+  S.rcMode = true; LS.set('f_rc_mode', true);
+  toast(`再修正の対象 ${items.length}品目を読み込みました。再修正モードを始めます` + (nm.length ? `(品目マスタにない・棚卸対象外: ${nm.join(', ')}。最新の品目マスタを読み込んでください)` : ''), 6000);
+  return true;
 }
 function scrExport() {
   const rows = sessionLog(), n = unexported().length, x = S.exportInfo;
@@ -10910,7 +11055,7 @@ function scrMasterImport() {
 }
 function scrAgg() {
   const A = S.agg, o = A.opt, R = A.result, book = A.book;
-  const F = ['すべて', '要対応', '差異あり', '未カウント', '帳簿なし', '差異なし'];
+  const F = ['すべて', '要対応', '差異あり', '未カウント', '再修正中', '修正済・差異あり', '修正済', '帳簿なし', '差異なし'];
   const need = r => !aggOut(r);
   const shown = R ? R.rows.filter(r => A.filter === 'すべて' ? true : A.filter === '要対応' ? need(r) : r.st === A.filter) : [];
   const cnt = k => R ? (k === 'すべて' ? R.rows.length : k === '要対応' ? R.rows.filter(need).length : R.rows.filter(r => r.st === k).length) : 0;
@@ -10919,7 +11064,7 @@ function scrAgg() {
     ${A.err ? `<div class="err">${esc(A.err)}</div>` : ''}
     <h2>1. カウントCSV(棚卸回: ${esc(S.session || '未設定')})</h2>
     <button class="btn primary block" data-act="aggPick">CSVをまとめて選ぶ(複数選択。マスタ変更CSVも一緒に選んでよい)</button>
-    ${A.files.length ? `<table class="diff" style="margin-top:8px"><tr><th>ファイル</th><th>担当者</th><th>行</th></tr>${A.files.map(f => `<tr><td>${esc(f.name)}${f.kind === 'マスタ変更' ? ' <span class="pill warn">マスタ変更</span>' : ''}${f.session && f.session !== S.session ? ' <span class="pill bad">別の棚卸回</span>' : ''}</td><td>${esc(f.counters)}</td><td>${f.n}</td></tr>`).join('')}</table>
+    ${A.files.length ? `<table class="diff" style="margin-top:8px"><tr><th>ファイル</th><th>担当者</th><th>行</th></tr>${A.files.map(f => `<tr><td>${esc(f.name)}${f.kind === 'マスタ変更' ? ' <span class="pill warn">マスタ変更</span>' : ''}${f.kind === '差異修正記録' ? ` <span class="pill">差異修正記録(PCの修正 ${f.n}件を戻した)</span>` : ''}${f.name.includes('_再修正_') ? ' <span class="pill warn">再修正</span>' : ''}${f.session && f.session !== S.session ? ' <span class="pill bad">別の棚卸回</span>' : ''}</td><td>${esc(f.counters)}</td><td>${f.n}</td></tr>`).join('')}</table>
       <p class="muted small">${A.files.filter(f => f.kind === 'カウント').length}ファイル・明細 ${A.rows.filter(r => r.Session === S.session).length}件(重複除去後)。同じ端末のCSVが複数あっても明細IDで1回しか数えません。${A.skipped?.length ? `集計に関係ないファイル ${A.skipped.length}件は読み飛ばしました。` : ''}</p>` : ''}
     ${A.mchg.length ? `<h2>他の端末で変更された品目マスタ</h2>
       <div class="panel">
@@ -10936,7 +11081,7 @@ function scrAgg() {
     <div class="panel">
       <div class="row"><div class="field" style="margin-top:0"><label for="agDate">棚卸日</label><input type="date" id="agDate" value="${esc(o.date)}"></div>
       <div class="field" style="margin-top:0"><label for="agLoc">ロケーションコード</label><input type="text" id="agLoc" value="${esc(o.loc)}"></div></div>
-      <label class="toggle"><input type="checkbox" id="agInc" ${o.incDiff ? 'checked' : ''}> 帳簿と差がある品目も実在庫で出力する(オフなら要対応へ)</label>
+      <label class="toggle"><input type="checkbox" id="agInc" ${o.incDiff ? 'checked' : ''}> 帳簿と差があり、まだ直していない品目も実在庫で出力する(通常はオフ。オフなら要対応へ)</label>
       <label class="toggle"><input type="checkbox" id="agZero" ${o.zeroUncounted ? 'checked' : ''}> 帳簿にあるのに登録がない品目を 0 で出力する</label>
       <div class="field"><label for="agEnc">GENに取り込むCSVの文字コード</label><select id="agEnc">
         <option value="sjis" ${(o.enc || 'sjis') === 'sjis' ? 'selected' : ''}>Shift-JIS(Excel で保存したCSVと同じ。従来の運用)</option>
@@ -10945,14 +11090,43 @@ function scrAgg() {
     </div>
     <button class="btn primary big block" data-act="aggRun" style="margin-top:12px" ${A.rows.length ? '' : 'disabled'}>集計する</button>
     ${R ? `<h2>結果(${R.rows.length}品目・明細 ${R.n}件・${fmtT(R.at)})</h2>
+      ${R.late ? `<div class="note">再修正の後に届いた初回の明細 ${R.late}件は使っていません(再修正した品目は、修正後の数に置き換わります)。</div>` : ''}
       <div class="stack"><button class="btn primary block" data-act="aggExGen">GEN取込CSVをダウンロード(${R.rows.filter(aggOut).length}品目)</button>
       <div class="row"><button class="btn" data-act="aggExNeed">要対応CSV(${cnt('要対応')})</button><button class="btn" data-act="aggExAll">集計CSV(全品目)</button></div></div>
+      <h2>4. 差異の修正</h2>
+      <div class="panel stack">
+        <p class="muted small" style="margin:0">帳簿と差がある品目を、①「再修正データ」にして担当者に数え直してもらう(数量・帳簿は入れません)か、② 品目をクリックして「数を直す・確定」でこのPCで直します。数え直した担当者のCSVを選び直して「集計する」と、修正後の数に置き換わります。</p>
+        <div class="row"><button class="btn" data-act="rcAddDiff">差異あり・未カウントを再修正に入れる</button><button class="btn primary" data-act="rcExport" ${R.rows.some(r => r.st === '再修正中') ? '' : 'disabled'}>再修正データを書き出す(${cnt('再修正中')}品目)</button></div>
+        <div class="row"><button class="btn" data-act="aggExRec">差異修正記録CSV</button><button class="btn danger ${S.armed === 'rcReqClear' ? 'armed' : ''}" data-act="rcReqClear" ${Object.keys(reqOf()).length ? '' : 'disabled'}>${S.armed === 'rcReqClear' ? 'もう一度押すと外します' : '再修正の依頼を全部外す'}</button></div>
+      </div>
       <div class="chips" role="group" style="margin-top:10px">${F.map(k => `<button class="chip" data-af="${k}" aria-pressed="${A.filter === k}">${k}<span class="k">${cnt(k)}</span></button>`).join('')}</div>
-      ${shown.length ? `<div class="list">${shown.map(r => `<div class="item" style="cursor:default"><div class="main">
-        <div><span class="c">${esc(r.code)}</span> <span class="pill ${({ '差異なし': 'ok', '差異あり': 'bad', '帳簿なし': 'bad', '未カウント': 'warn' })[r.st] || ''}">${esc(r.st)}</span>${aggOut(r) ? '' : ' <span class="pill">GEN取込に出ない</span>'}</div>
-        <div class="small">${esc(r.name)}</div><div class="muted small">帳簿 ${fmtN(r.book)}・実在庫 ${fmtN(r.qty)}${r.unit ? ' ' + esc(r.unit) : ''}・${r.n}件${r.v ? '(取消 ' + r.v + ')' : ''}${r.who ? '・' + esc(r.who) : ''}${r.loc ? '・' + esc(r.loc) : ''}</div></div>
-        <div class="n">${r.diff > 0 ? '+' : ''}${fmtN(r.diff)}</div></div>`).join('')}</div>` : '<p class="muted">該当なし</p>'}` : ''}
+      ${shown.length ? `<div class="list">${shown.map(r => `<div class="item" data-ao="${esc(r.code)}"><div class="main">
+        <div><span class="c">${esc(r.code)}</span> <span class="pill ${({ '差異なし': 'ok', '修正済': 'ok', '差異あり': 'bad', '修正済・差異あり': 'bad', '帳簿なし': 'bad', '未カウント': 'warn', '再修正中': 'warn' })[r.st] || ''}">${esc(r.st)}</span>${aggOut(r) ? '' : ' <span class="pill">GEN取込に出ない</span>'}${r.method ? ` <span class="pill">${esc(r.method)}</span>` : ''}${r.reason ? ` <span class="pill">理由: ${esc(r.reason)}</span>` : ''}</div>
+        <div class="small">${esc(r.name)}</div><div class="muted small">帳簿 ${fmtN(r.book)}・${r.method ? `初回 ${fmtN(r.first)} → ` : ''}実在庫 ${fmtN(r.qty)}${r.unit ? ' ' + esc(r.unit) : ''}・${r.n}件${r.v ? '(取消 ' + r.v + ')' : ''}${r.who ? '・' + esc(r.who) : ''}${r.loc ? '・' + esc(r.loc) : ''}</div>
+        ${needWhy(r) && !aggOut(r) ? `<div class="small" style="color:var(--bad)">${esc(needWhy(r))}</div>` : ''}</div>
+        <div class="n">${r.diff > 0 ? '+' : ''}${fmtN(r.diff)}</div></div>${A.open === r.code ? aggDetail(r) : ''}`).join('')}</div>` : '<p class="muted">該当なし</p>'}` : ''}
   </main>`;
+}
+/* 集計結果の品目をクリックした時の詳細(v3.0): 再修正に入れる/外す・数を直す・確定・PCの修正を取り消す */
+function aggDetail(r) {
+  const rq = reqOf()[r.code], a = adjOf()[r.code], f = S.agg.adjForm;
+  return `<div class="panel" style="margin:0 0 8px;border-top:0">
+    <div class="small">帳簿 <b>${fmtN(r.book)}</b> / 初回の合計 <b>${fmtN(r.first)}</b>${r.round > 1 ? ` / 再修正 第${r.round}回 <b>${fmtN(r.qty)}</b>` : ''}${a ? ` / PCで直した数 <b>${fmtN(a.qty)}</b>` : ''} ${esc(r.unit)}</div>
+    ${r.fixedBy ? `<div class="muted small">修正: ${esc(r.method)}・${esc(r.fixedBy)}・${fmtT(r.fixedAt)}${r.reason ? '・理由 ' + esc(r.reason) : ''}</div>` : ''}
+    ${r.loc1 ? `<div class="muted small">初回の置き場: ${esc(r.loc1)}</div>` : ''}
+    ${r.warn ? `<div class="note">${esc(r.warn)}</div>` : ''}${r.late ? `<div class="note">再修正の後に届いた初回の明細 ${r.late}件は使っていません</div>` : ''}
+    <div class="row" style="margin-top:8px">
+      ${rq ? `<button class="btn" data-act="rcReqDel">再修正から外す(第${rq.round}回)</button>` : `<button class="btn" data-act="rcReqAdd">再修正に入れる(第${Math.max(2, r.round + 1)}回)</button>`}
+      <button class="btn ${f ? '' : 'primary'}" data-act="adjOpen">${f ? '閉じる' : '数を直す・確定'}</button>
+      ${a ? `<button class="btn danger" data-act="adjDel">PCで直した数を取り消す</button>` : ''}
+    </div>
+    ${f ? `<div class="row" style="margin-top:8px">
+      <div class="field" style="margin-top:0"><label for="adjQty">正しい数(${esc(r.unit || '管理単位')})</label><input type="text" inputmode="decimal" id="adjQty" value="${esc(String(a ? a.qty : r.qty))}" autocomplete="off"></div>
+      <div class="field" style="margin-top:0"><label for="adjReason">理由(必須)</label><select id="adjReason"><option value="">(選ぶ)</option>${reasonList().map(x => `<option ${(a?.reason || '').split(':')[0] === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></div></div>
+      <div class="field"><label for="adjNote">メモ(任意)</label><input type="text" id="adjNote" value="${esc((a?.reason || '').split(':').slice(1).join(':'))}" autocomplete="off"></div>
+      <button class="btn primary block" data-act="adjSave" style="margin-top:8px">この数で確定する</button>
+      <p class="muted small">今の実在庫の数のまま確定する時も、理由を選んで「この数で確定する」を押します。確定すると GEN取込に出ます(帳簿にある品目)。</p>` : ''}
+  </div>`;
 }
 function scrBook() {
   const sb = savedBook(), U = S.bookUi;
@@ -10990,6 +11164,10 @@ function scrSetting() {
       <div class="field"><label for="mailIn">メール(任意)</label><input type="email" id="mailIn" value="${esc(S.user.email)}" autocomplete="off"></div>
       <button class="btn primary block" data-act="saveBasic" style="margin-top:10px">保存</button>
     </div>
+    <h2>再修正(数え直しの担当者)</h2>
+    <div class="stack">
+      <button class="btn block" data-act="rcLoad">再修正データを読み込む${rcReq() ? `<span class="muted small">(${rcReq().items.length}品目 読み込み済み)</span>` : ''}</button>
+    </div>
     <h2>管理者・PC向け</h2>
     <div class="stack">
       <button class="btn block" data-go="book">帳簿在庫を読み込む(棚卸の前に)${savedBook() ? `<span class="muted small">(${esc(S.session)}: ${savedBook().n}品目 読み込み済み)</span>` : ''}</button>
@@ -11018,7 +11196,7 @@ function scrSetting() {
     </div>
   </main>`;
 }
-const SCREENS = { scan: scrScan, history: scrHistory, export: scrExport, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, setting: scrSetting };
+const SCREENS = { scan: scrScan, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, setting: scrSetting };
 function render() {
   const y = window.scrollY, act = document.activeElement?.id;
   $('#app').innerHTML = (SCREENS[S.screen] || scrScan)() + tabs();
@@ -11040,14 +11218,20 @@ function openEdit(code, isNew) {
 }
 
 /* ---------- カメラ(jsQR) ---------- */
-// ホーム画面から起動したiPhone(standalone)では、映像が真っ暗のままになることがある。
-// 対策: 先に画面を表示してから映像をつなぐ / 映像が来なければ一度つなぎ直す / それでもだめなら「写真で読む」へ案内
+// ホーム画面から起動したiPhone(standalone)では、機種によって映像が真っ暗のままになることがある(v2.9: iPhone 14 で確認)。
+// 対策: 先に画面を表示してから映像をつなぐ / 2.5秒で映像(明るさ)を確認し、真っ暗なら背面のカメラを順に切り替える
+//       / 映ったカメラはこの端末に覚えて次から最初に使う / 全部だめなら「写真で読む」へ案内
+// 画面の上に、使っているカメラの名前・大きさ・明るさを小さく出す(不具合の報告用)
 const Cam = {
-  stream: null, raf: 0, timer: 0, retried: false,
+  stream: null, raf: 0, timer: 0, devs: [], devIdx: -1, tries: 0, bright: -1,
   msg(t) { const m = $('#camMsg'); if (m) m.textContent = t; },
+  info(t) { const m = $('#camInfo'); if (m) m.textContent = t; },
   shown() { return $('#cam').classList.contains('show'); },
+  track() { return this.stream ? this.stream.getVideoTracks()[0] : null; },
+  curId() { const t = this.track(); return (t && t.getSettings && t.getSettings().deviceId) || ''; },
   async start(constraints) {
     const v = $('#camVideo');
+    this.bright = -1;
     this.stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
     v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
     v.srcObject = null; v.srcObject = this.stream;
@@ -11055,31 +11239,64 @@ const Cam = {
     await v.play().catch(() => {});
   },
   stopTracks() { if (this.stream) this.stream.getTracks().forEach(t => t.stop()); this.stream = null; },
+  // 背面カメラの一覧(普通の背面カメラを先に。前面は背面がない時だけ)。名前は許可の後でないと取れない
+  async listBack() {
+    const all = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    const score = l => /front|前面|user/i.test(l) ? 9 : /ultra|超広角/i.test(l) ? 4 : /tele|望遠/i.test(l) ? 5 : /dual|デュアル/i.test(l) ? 1 : /triple|トリプル/i.test(l) ? 2 : /back|rear|背面|environment/i.test(l) ? 0 : 6;
+    const list = all.map(d => ({ id: d.deviceId, label: d.label || 'カメラ', s: score(d.label || '') })).sort((a, b) => a.s - b.s);
+    const back = list.filter(d => d.s < 9);
+    return back.length ? back : list;
+  },
+  showInfo() {
+    const v = $('#camVideo'), t = this.track();
+    const name = (t && t.label) || (this.devs[this.devIdx] && this.devs[this.devIdx].label) || 'カメラ';
+    this.info(`${name}${this.devs.length > 1 ? `(${this.devIdx + 1}/${this.devs.length})` : ''} ${v.videoWidth}×${v.videoHeight} 明るさ ${this.bright < 0 ? '-' : Math.round(this.bright)}`);
+  },
   async open() {
     if (typeof jsQR === 'undefined') return toast('QR読取のライブラリが読み込めません。コードを入力してください');
     if (!navigator.mediaDevices?.getUserMedia) return this.photo();
-    this.retried = false;
-    $('#cam').classList.add('show'); this.msg('カメラを起動しています…');
-    try { await this.start({ facingMode: 'environment', width: { ideal: 1280 } }); }
-    catch (e) { this.close(); return toast('カメラを使えません(' + e.name + ')。「写真で読む」かコードの入力で登録できます', 4500); }
+    this.tries = 0; this.devs = []; this.devIdx = -1;
+    $('#cam').classList.add('show'); this.msg('カメラを起動しています…'); this.info('');
+    const saved = LS.get('f_cam_dev', '');
+    try {
+      if (saved) { try { await this.start({ deviceId: { exact: saved } }); } catch (e) { this.stream = null; } }
+      if (!this.stream) await this.start({ facingMode: 'environment', width: { ideal: 1280 } });
+    } catch (e) { this.close(); return toast('カメラを使えません(' + e.name + ')。「写真で読む」かコードの入力で登録できます', 4500); }
     if (!this.shown()) return this.stopTracks(); // 起動中に「閉じる」が押された
+    this.devs = await this.listBack().catch(() => []);
+    this.devIdx = Math.max(0, this.devs.findIndex(d => d.id === this.curId()));
     this.msg('QRコードを枠に入れてください');
     this.loop();
     clearTimeout(this.timer);
     this.timer = setTimeout(() => this.watch(), 2500);
   },
-  // 映像が来ているかの確認。来ていなければ1回だけ条件を簡単にしてつなぎ直す
+  // 映像が来ているか(大きさ・再生中・明るさ)
+  ok() {
+    const v = $('#camVideo'), t = this.track();
+    return !!(t && t.readyState === 'live' && !t.muted && v.videoWidth && !v.paused && this.bright > 6);
+  },
+  // 映っていれば、そのカメラを覚えて終わり。真っ暗なら次の背面カメラへ(全部試したら「写真で読む」へ案内)
   async watch() {
-    const v = $('#camVideo');
-    if (!this.stream || (v.videoWidth && !v.paused)) return;
-    if (!this.retried) {
-      this.retried = true; this.msg('カメラをつなぎ直しています…'); this.stopTracks();
-      try { await this.start({ facingMode: 'environment' }); } catch (e) { this.stream = null; }
-      if (!this.shown()) return this.stopTracks();
-      if (this.stream) { this.msg('QRコードを枠に入れてください'); this.loop(); this.timer = setTimeout(() => this.watch(), 2500); return; }
-    }
+    if (!this.shown()) return;
+    this.showInfo();
+    if (this.stream && this.ok()) { const id = this.curId(); if (id) LS.set('f_cam_dev', id); return; }
+    const n = Math.max(1, this.devs.length);
+    if (this.tries < n) { this.tries++; return this.next(`カメラを切り替えています(${this.tries}/${n})…`); }
+    LS.del('f_cam_dev');
     this.msg('カメラの映像が出ません。下の「写真で読む」を使ってください');
   },
+  async next(text) {
+    this.stopTracks(); cancelAnimationFrame(this.raf); this.msg(text);
+    try {
+      if (this.devs.length) { this.devIdx = (this.devIdx + 1) % this.devs.length; await this.start({ deviceId: { exact: this.devs[this.devIdx].id } }); }
+      else await this.start({ facingMode: 'environment' });
+    } catch (e) { this.stream = null; }
+    if (!this.shown()) return this.stopTracks();
+    if (this.stream) { this.msg('QRコードを枠に入れてください'); this.loop(); }
+    clearTimeout(this.timer); this.timer = setTimeout(() => this.watch(), 2500);
+  },
+  // 「カメラ切替」ボタン: 手で次のカメラへ(切り替えた先が真っ暗なら、また自動で次へ)
+  switchCam() { if (!this.shown()) return; this.tries = 0; this.next('カメラを切り替えています…'); },
   loop() {
     cancelAnimationFrame(this.raf);
     const v = $('#camVideo'), c = $('#camCanvas'), ctx = c.getContext('2d', { willReadFrequently: true });
@@ -11087,14 +11304,17 @@ const Cam = {
       if (!this.stream) return;
       if (v.readyState >= 2 && v.videoWidth) {
         const w = 640, h = Math.round(v.videoHeight * 640 / v.videoWidth); c.width = w; c.height = h; ctx.drawImage(v, 0, 0, w, h);
-        const img = ctx.getImageData(0, 0, w, h), r = jsQR(img.data, w, h, { inversionAttempts: 'attemptBoth' });
+        const img = ctx.getImageData(0, 0, w, h), d = img.data;
+        let sum = 0, cnt = 0; for (let i = 0; i < d.length; i += 4 * 97) { sum += d[i] + d[i + 1] + d[i + 2]; cnt++; }
+        this.bright = cnt ? sum / cnt / 3 : 0;
+        const r = jsQR(d, w, h, { inversionAttempts: 'attemptBoth' });
         if (r && r.data && r.data.trim()) { this.close(); onScanned(r.data.trim()); return; }
       }
       this.raf = requestAnimationFrame(tick);
     };
     this.raf = requestAnimationFrame(tick);
   },
-  close() { clearTimeout(this.timer); cancelAnimationFrame(this.raf); this.stopTracks(); const v = $('#camVideo'); if (v) v.srcObject = null; $('#cam').classList.remove('show'); this.msg('QRコードを枠に入れてください'); },
+  close() { clearTimeout(this.timer); cancelAnimationFrame(this.raf); this.stopTracks(); const v = $('#camVideo'); if (v) v.srcObject = null; $('#cam').classList.remove('show'); this.msg('QRコードを枠に入れてください'); this.info(''); },
   // iPhone標準のカメラで撮った写真からQRを読む(映像が出ない端末・開き方でも使える)
   photo() {
     if (typeof jsQR === 'undefined') return toast('QR読取のライブラリが読み込めません。コードを入力してください');
@@ -11129,7 +11349,7 @@ function onScanned(code) { if (navigator.vibrate) navigator.vibrate(60); S.code 
 
 /* ---------- イベント ---------- */
 const ACTIONS = {
-  camOpen: () => Cam.open(), camClose: () => Cam.close(), photoScan: () => Cam.photo(), reloadApp: () => location.reload(), register: () => register(),
+  camOpen: () => Cam.open(), camClose: () => Cam.close(), camSwitch: () => Cam.switchCam(), photoScan: () => Cam.photo(), reloadApp: () => location.reload(), register: () => register(),
   export: () => exportCounts(),
   clearSession: () => { if (S.armed !== 'clear') { S.armed = 'clear'; return render(); } const n = sessionLog().length; saveLog(log().filter(e => e.Session !== S.session)); S.exportInfo = null; LS.del('f_export'); S.armed = null; toast(`${n}件をこの端末から消しました`); render(); },
   masterFromScan: () => openEdit(S.code.trim(), !master()[S.code.trim()]),
@@ -11178,14 +11398,43 @@ const ACTIONS = {
     const rows = R.rows.filter(aggOut).sort((a, b) => a.code.localeCompare(b.code)).map(r => [d, r.code, o.loc || '0000000000000', '', r.qty]); if (!rows.length) return toast('出力できる品目がありません');
     downloadFile(genFile(`GEN取込_${fileSafe(S.session)}.csv`, csv(['棚卸日', '品目コード (品目)', 'ロケーションコード (ロケーション)', '製番(ロット品目の場合は「製番」列にロット番号を入力してください)', '棚卸数'], rows))); },
   aggExNeed: () => { const R = S.agg.result; if (!R) return; const rows = R.rows.filter(r => !aggOut(r)); if (!rows.length) return toast('要対応はありません');
-    blobDownload(`要対応_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '状態', '帳簿', '実在庫', '差異', '担当者', '置き場', '対応'], rows.map(r => [r.code, r.name, r.st, r.book, r.qty, r.diff, r.who, r.loc,
-      r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : r.st === '未カウント' ? '数えていない。確認して登録、または在庫0なら設定で0出力' : '帳簿と差がある。数え直すか、設定で出力']))); },
-  aggExAll: () => { const R = S.agg.result; if (!R) return; blobDownload(`集計_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '単位', '帳簿', '実在庫', '差異', '状態', '帳簿にある', '登録件数', '取消件数', '担当者', '置き場'], R.rows.map(r => [r.code, r.name, r.unit, r.book, r.qty, r.diff, r.st, r.inBook, r.n, r.v, r.who, r.loc]))); },
+    blobDownload(`要対応_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '状態', '帳簿', '実在庫', '差異', '担当者', '置き場', '対応'], rows.map(r => [r.code, r.name, r.st, r.book, r.qty, r.diff, r.who, r.loc, needWhy(r) || '設定で出力']))); },
+  aggExAll: () => { const R = S.agg.result; if (!R) return; blobDownload(`集計_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '単位', '帳簿', '初回', '実在庫', '差異', '状態', '修正の方法', '理由', '帳簿にある', '登録件数', '取消件数', '担当者', '置き場'], R.rows.map(r => [r.code, r.name, r.unit, r.book, r.first, r.qty, r.diff, r.st, r.method, r.reason, r.inBook, r.n, r.v, r.who, r.loc]))); },
+  /* v3.0 差異の修正(管理者のPC) */
+  aggExRec: () => { const R = S.agg.result; if (!R) return; const rows = R.rows.filter(r => r.method || r.st !== '差異なし'); if (!rows.length) return toast('修正・差異のある品目はありません');
+    blobDownload(`差異修正記録_${fileSafe(S.session)}_${stamp()}.csv`, csv(REC_COLS, rows.map(r => [REC_KIND, S.session, r.code, r.name, r.unit, r.book, r.first, r.qty, r.diff, r.st, r.method, r.round, r.reason, r.fixedBy, r.fixedAt, aggOut(r) ? '出す' : '出さない'])));
+    toast('差異修正記録CSVをダウンロードしました。Teams の棚卸フォルダに保存しておくと、PCを替えた時も読み込んで続けられます', 5000); },
+  rcAddDiff: () => { const R = S.agg.result; if (!R) return; const req = reqOf(), adj = adjOf(); let n = 0;
+    for (const r of R.rows) if (r.inBook && ['差異あり', '未カウント', '修正済・差異あり'].includes(r.st) && !adj[r.code] && !req[r.code]) { req[r.code] = { round: Math.max(2, r.round + 1), at: nowIso() }; n++; }
+    saveReq(req); reRunAgg(); toast(n ? `${n}品目を再修正に入れました。「再修正データを書き出す」で担当者に渡してください` : '入れる品目はありません', 4500); render(); },
+  rcReqAdd: () => { const r = S.agg.result?.rows.find(x => x.code === S.agg.open); if (!r) return; const req = reqOf(); req[r.code] = { round: Math.max(2, r.round + 1), at: nowIso() }; saveReq(req); reRunAgg(); render(); },
+  rcReqDel: () => { const req = reqOf(); delete req[S.agg.open]; saveReq(req); reRunAgg(); render(); },
+  rcReqClear: () => { if (S.armed !== 'rcReqClear') { S.armed = 'rcReqClear'; return render(); } saveReq({}); S.armed = null; reRunAgg(); toast('再修正の依頼を全部外しました'); render(); },
+  rcExport: async () => { const R = S.agg.result; if (!R) return; const req = reqOf(), m = master();
+    const rows = R.rows.filter(r => r.st === '再修正中'); if (!rows.length) return toast('再修正中の品目がありません(先に「再修正に入れる」)');
+    const text = csv(RC_COLS, rows.map(r => [RC_KIND, S.session, r.code, r.name, m[r.code]?.Spec || '', r.unit, req[r.code].round, r.loc1, S.user.name || '管理者', req[r.code].at]));
+    const name = `再修正_${fileSafe(S.session)}_${stamp()}.csv`;
+    const res = await shareFilesOrDownload([{ name, text }]); if (res === 'cancel') return;
+    toast(`${name}(${rows.length}品目)を書き出しました。Teams の「棚卸しアプリ」に保存して、数え直す担当者に伝えてください`, 6000); },
+  adjOpen: () => { S.agg.adjForm = !S.agg.adjForm; render(); },
+  adjSave: () => { const code = S.agg.open; if (!code) return; const q = num($('#adjQty').value), rs = $('#adjReason').value, note = $('#adjNote').value.trim();
+    if (q == null || q < 0) return toast('正しい数を入れてください'); if (!rs) return toast('理由を選んでください(PCで直す時は必須)');
+    const adj = adjOf(); adj[code] = { qty: rnd(q), reason: rs + (note ? ':' + note : ''), by: S.user.name || '管理者', at: nowIso() }; saveAdj(adj);
+    const req = reqOf(); if (req[code]) { delete req[code]; saveReq(req); }
+    S.agg.adjForm = false; reRunAgg(); toast(`${code} を ${fmtN(q)} で確定しました`); render(); },
+  adjDel: () => { const adj = adjOf(); delete adj[S.agg.open]; saveAdj(adj); S.agg.adjForm = false; reRunAgg(); toast('PCで直した数を取り消しました'); render(); },
+  /* v3.0 再修正モード(数え直す担当者の端末) */
+  rcLoad: async () => { if (!S.session) return toast('先に設定で棚卸回を入れてください'); try { if (await loadRecountFile()) go('recount'); } catch (e) { toast(e.message, 5000); } },
+  rcStart: () => { if (!rcReq()) return go('recount'); S.rcMode = true; LS.set('f_rc_mode', true); toast('再修正モードを始めました。対象の品目だけ登録できます'); render(); },
+  rcEnd: () => { S.rcMode = false; LS.set('f_rc_mode', false); toast('再修正モードを終えました(普段の登録に戻ります)'); render(); },
+  rcClear: () => { if (S.armed !== 'rcClear') { S.armed = 'rcClear'; return render(); } const all = rcStore(); delete all[S.session]; LS.set('f_rc', all); S.rcMode = false; LS.set('f_rc_mode', false); S.armed = null; toast('再修正データを端末から消しました(登録した明細は残ります)'); go('scan'); },
   resetMaster: () => { if (S.armed !== 'resetMaster') { S.armed = 'resetMaster'; return render(); } LS.del('f_master'); LS.del('f_master_at'); S.armed = null; toast('品目マスタを消しました。「マスタCSVを読み込む」で読み込み直してください', 4000); render(); },
 };
 document.addEventListener('click', async ev => {
-  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick]'); if (!el) return; const d = el.dataset;
+  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick],[data-rcpick],[data-ao]'); if (!el) return; const d = el.dataset;
   if (d.pick) return pickItem(d.pick);
+  if (d.rcpick) { S.rcMode = true; LS.set('f_rc_mode', true); S.code = d.rcpick; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; go('scan'); if (lookup(d.rcpick)) setTimeout(() => $('#qtyIn')?.focus(), 50); return; }
+  if (d.ao) { S.agg.open = S.agg.open === d.ao ? '' : d.ao; S.agg.adjForm = false; return render(); }
   if (d.go) return go(d.go);
   if (d.void) { if (S.armed === d.void) return voidEntry(d.void); S.armed = d.void; return render(); }
   if (d.mf) { S.master.filter = d.mf; S.master.limit = 150; return render(); }
@@ -11217,6 +11466,7 @@ document.addEventListener('change', ev => {
     const el = $('#sugg'); if (el) el.innerHTML = suggHtml(v);
   }
   if (id === 'packSel') { S.packIdx = +t.value; render(); }
+  if (id === 'rcReason') S.rcReason[S.code.trim()] = t.value;
   if (id === 'impAll') { S.imp.all = t.checked; S.imp.preview = null; render(); }
   if (id === 'impNewT') S.imp.newTarget = t.checked;
   if (['agDate', 'agLoc', 'agInc', 'agZero', 'agEnc'].includes(id)) { S.agg.opt = { date: $('#agDate').value, loc: $('#agLoc').value.trim(), incDiff: $('#agInc').checked, zeroUncounted: $('#agZero').checked, enc: $('#agEnc').value }; LS.set('f_agg_opt', S.agg.opt); }
