@@ -1,5 +1,5 @@
 // 棚卸カウント Service Worker:アプリ本体を端末に保存し、電波がなくても起動できるようにする
-const CACHE = 'tana-file-3.0';
+const CACHE = 'tana-file-3.3';
 const FILES = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 // v2.8: 差し替え時にブラウザの一時保存(GitHub Pages は最大10分)の古いファイルを使わないよう、cache:'reload' で取り直す
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting())); });

@@ -10260,7 +10260,10 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-3.0';
+const APP_VERSION = 'file-3.3';
+/* v3.2(2026-10-05)運用の決定: 再カウントは紙で行い、修正は管理者が「集約CSV」に直接行う。
+   アプリの再修正モード・PCで数を直す機能は画面から隠す(仕組みは残す。true にすれば戻る) */
+const FEATURE_RECOUNT = false;
 const APP_VERSION_LABEL = 'v' + APP_VERSION.replace(/^file-/, '');   // 画面の右上に出す版数(例 v2.8)
 /* 品目マスタ(埋め込みなし) */
 const MASTER_SEED = [];   // v2.2: 品目マスタは埋め込まない(公開URLに品名・得意先名を載せないため)。初回に「マスタCSVを読み込む」
@@ -10302,9 +10305,9 @@ const LS = {
   set(k, v) { mem[k] = v; try { localStorage.setItem(LS_NS + k, JSON.stringify(v)); } catch (e) {} },
   del(k) { delete mem[k]; try { localStorage.removeItem(LS_NS + k); } catch (e) {} },
 };
-/* GEN API のトークン(v2.5): 既定は「この端末に保存しない」= 画面を閉じると消える。保存を選んだ時だけ localStorage に入れる */
-let memToken = '';
-const getToken = () => memToken || LS.get('f_gen_token', '');
+/* GEN API(v3.1): GEN の API はブラウザから呼べない(CORS 未許可。2026-10-05 確認)ため、取得は管理者PCの「品目マスタ更新.bat」で行う。
+   端末にはトークンを置かない。前の版で保存したトークンが残っていれば消す */
+LS.del('f_gen_token');
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() :
   'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
 const nowIso = () => new Date().toISOString();
@@ -10427,7 +10430,14 @@ const log = () => LS.get('f_log', []);          // この端末のカウント�
 const saveLog = l => LS.set('f_log', l);
 const mlog = () => LS.get('f_mlog', []);        // 品目マスタの変更履歴(TanaMasterLog と同じ列)
 const saveMlog = l => LS.set('f_mlog', l);
-const lookup = code => { const it = master()[code]; return it && it.CountTarget ? it : null; };
+/* 棚卸対象(v3.3): 品目コードの頭文字で決める(既定 C・P・O。設定 →「棚卸対象のコード」で複数選べる)。
+   GEN で非表示・GEN にない品目(GEN から来た品目で InGen=false)は対象外。品目ごとの「棚卸対象」の印は使わない */
+const DEFAULT_TARGET_PREFIXES = 'C,P,O';
+const targetPrefixes = () => String(cfgVal('TargetPrefixes', DEFAULT_TARGET_PREFIXES)).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const codeHead = code => String(code || '').trim().charAt(0).toUpperCase();
+const isHidden = it => !!it && it.Source !== 'APP' && it.InGen === false;
+const isTarget = it => !!it && !isHidden(it) && targetPrefixes().some(p => String(it.Title || '').toUpperCase().startsWith(p));
+const lookup = code => { const it = master()[code]; return isTarget(it) ? it : null; };
 function packs(it) {
   const p = String(it?.Packs || '').split(';').map(s => s.trim()).filter(Boolean).map(s => { const i = s.lastIndexOf(':'); return { n: i > 0 ? s.slice(0, i).trim() : s, f: (i > 0 ? num(s.slice(i + 1)) : 1) || 1 }; });
   return p.length ? p : [{ n: 'バラ' + (it?.Unit ? '(' + it.Unit + ')' : ''), f: 1 }];
@@ -10520,25 +10530,6 @@ async function restoreFromCsv() {
 
 /* ---------- 品目マスタ:取込・GEN API・編集・CSV ---------- */
 function pick(obj, path) { if (!path) return obj; return String(path).split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj); }
-async function fetchGenMaster() {
-  const url = String(cfgVal('GenApiUrl', '')).trim(), token = getToken();
-  if (!url || /★/.test(url)) throw new Error('設定の「GEN API」にURLを入れてください');
-  if (!token) throw new Error('設定の「GEN API」にトークンを入れてください(この端末だけに保存されます)');
-  const hName = String(cfgVal('GenApiAuthHeader', 'Authorization')).trim(), hFmt = String(cfgVal('GenApiAuthFormat', 'Bearer {token}'));
-  const headers = { Accept: 'application/json' }; if (hName) headers[hName] = hFmt.replace('{token}', token);
-  let res;
-  try { res = await fetch(url.replace('{token}', encodeURIComponent(token)), { headers }); }
-  catch (e) { throw new Error('GENのAPIに接続できませんでした。ブラウザから直接呼べない(CORS)可能性があります。その場合は「GEN品目マスタ取得.ps1」で取得して貼り付けてください。(' + e.message + ')'); }
-  if (!res.ok) throw new Error('GENのAPIがエラーを返しました: HTTP ' + res.status);
-  const json = await res.json();
-  const list = pick(json, cfgVal('GenApiListPath', ''));
-  if (!Array.isArray(list)) throw new Error('応答の中に品目の一覧が見つかりません。設定「一覧の項目名」(例 data / data.items)を確認してください');
-  const f = { code: cfgVal('GenApiFieldCode', 'item_code'), name: cfgVal('GenApiFieldName', 'item_name'), spec: cfgVal('GenApiFieldSpec', 'spec'), unit: cfgVal('GenApiFieldUnit', 'unit') };
-  const recs = list.map(o => ({ code: String(pick(o, f.code) ?? '').trim(), name: String(pick(o, f.name) ?? '').trim(), spec: f.spec ? String(pick(o, f.spec) ?? '').trim() : '', unit: f.unit ? String(pick(o, f.unit) ?? '').trim() : '' })).filter(r => r.code);
-  if (!recs.length) throw new Error('品目コードが1件も取れませんでした。設定「品目コードの項目名」を確認してください');
-  const cols = String(cfgVal('ImportColumns', '1,2,3,6,4')).split(',').map(x => parseInt(x, 10)), w = Math.max(...cols);
-  return recs.map(r => { const row = Array(w).fill(''); row[cols[0] - 1] = r.code; row[cols[1] - 1] = r.name; row[cols[2] - 1] = r.spec; row[cols[3] - 1] = r.unit; return row.join('\t'); }).join('\n');
-}
 function previewImport() {
   const [ci, ni, si, ui] = String(cfgVal('ImportColumns', '1,2,3,6,4')).split(',').map(s => parseInt(s, 10) - 1);
   const recs = new Map();
@@ -10573,7 +10564,7 @@ function saveItem(f, isNew) {
   const at = nowIso(), by = S.user.name || '', m = master(), o = m[f.Title];
   if (isNew && o) throw new Error('この品目コードはすでに登録されています');
   if (!isNew && !o) throw new Error('品目が見つかりません');
-  const L = { ItemName: '品名', Spec: '規格', Unit: '単位', Category: '分類', Packs: '荷姿', CountTarget: '棚卸対象' };
+  const L = { ItemName: '品名', Spec: '規格', Unit: '単位', Category: '分類', Packs: '荷姿' };   // v3.3: 棚卸対象はコードで自動判定(品目ごとの印は記録しない)
   const show = (k, v) => k === 'CountTarget' ? (v ? 'はい' : 'いいえ') : (v || '(空)');
   let changes = '', genF = false;
   for (const k of Object.keys(L)) { const a = o ? o[k] : (k === 'CountTarget' ? null : ''); if (isNew || a !== f[k]) { changes += `${L[k]}: ${isNew ? '' : show(k, a) + ' → '}${show(k, f[k])}; `; if (['ItemName', 'Spec', 'Unit'].includes(k)) genF = true; } }
@@ -10652,9 +10643,21 @@ function parseCountCsv(file) {
   return rows.slice(1).map(r => { const o = { ファイル名: file.name }; COUNT_COLS.forEach(c => o[c] = ix[c] >= 0 ? String(r[ix[c]] ?? '').trim() : ''); o.Qty = num(o.Qty) || 0; o.InputQty = num(o.InputQty); o.Factor = num(o.Factor); return o; }).filter(o => o.Title);
 }
 function parseBook(text) {
+  const all = parseDelimited(text), m = new Map();
+  // v3.2: 見出しの行(「品目コード」と「理論在庫…」がある行)があれば、列の名前で読む
+  //       (管理者のツールが作る「在庫リスト_….csv」、GEN の在庫リストの CSV 出力、棚卸登録の見出しつき貼り付け)
+  //       配布用(担当者向け)の在庫リストは数の列がなく「在庫あり」の列だけ → m.flagOnly = true(集計の照合には使えない)
+  const hi = all.slice(0, 20).findIndex(r => { const h = r.map(x => String(x).trim()); return h.includes('品目コード') && h.some(x => /^理論在庫|^在庫あり$/.test(x)); });
+  if (hi >= 0) {
+    const h = all[hi].map(x => String(x).trim()), col = re => h.findIndex(x => re.test(x));
+    const ci = h.indexOf('品目コード'), ni = col(/^品目名/), si = col(/^規格/), ui = col(/^管理単位/), bi = col(/^理論在庫/), fi = h.indexOf('在庫あり');
+    const g = (r, i) => i >= 0 ? String(r[i] ?? '').trim() : '';
+    for (const r of all.slice(hi + 1)) { const code = g(r, ci); if (code) m.set(code, { code, name: g(r, ni), spec: g(r, si), unit: g(r, ui), qty: bi >= 0 ? (num(r[bi]) || 0) : (toBool(g(r, fi)) ? 1 : 0) }); }
+    if (bi < 0) m.flagOnly = true;
+    return m;
+  }
   const [ci, ni, si, ui, bi] = String(cfgVal('ImportColumns', '1,2,3,6,4')).split(',').map(x => parseInt(x, 10) - 1);
-  const m = new Map();
-  for (const r of parseDelimited(text)) {
+  for (const r of all) {
     const code = String(r[ci] ?? '').trim(); if (!code || /品目コード|^コード$|^code$|^Title$/i.test(code)) continue;
     m.set(code, { code, name: String(r[ni] ?? '').trim(), spec: String(r[si] ?? '').trim(), unit: String(r[ui] ?? '').trim(), qty: num(r[bi]) || 0 });
   }
@@ -10704,7 +10707,9 @@ function runAgg() {
   }
   const sum = list => rnd(list.reduce((s, r) => s + (r.Qty || 0), 0));
   const uniq = (list, f) => [...new Set(list.map(f).filter(Boolean))].join('、');
-  const codes = new Set([...by.keys(), ...[...book.values()].filter(b => b.qty !== 0).map(b => b.code), ...Object.keys(adj)]);
+  // v3.2: 在庫リストには原料なども全部入るので、「未カウント」にするのは品目マスタで棚卸対象の品目だけ(マスタが空なら全部)
+  const target = c => !Object.keys(m).length || isTarget(m[c]);
+  const codes = new Set([...by.keys(), ...[...book.values()].filter(b => b.qty !== 0 && target(b.code)).map(b => b.code), ...Object.keys(adj)]);
   const out = []; let late = 0;
   for (const code of codes) {
     const list = by.get(code) || [], b = book.get(code), it = m[code], a = adj[code], rq = req[code];
@@ -10787,7 +10792,7 @@ function fuzzyFind(q, items, limit = 20) {
 function suggHtml(q) {
   q = String(q ?? '').trim();
   if (!q || master()[q]) return '';
-  const r = fuzzyFind(q, Object.values(master()).filter(x => x.CountTarget), 12);
+  const r = fuzzyFind(q, Object.values(master()).filter(isTarget), 12);
   if (!r.length) return `<p class="muted small" style="margin:8px 0 0">「${esc(q)}」に当たる品目がありません(棚卸対象の品目から探しています)</p>`;
   return `<p class="muted small" style="margin:8px 0 4px">候補 ${r.length}件(タップで選ぶ)</p><div class="list">${r.map(it => `<button class="item" data-pick="${esc(it.Title)}"><div class="main">
     <div><span class="c">${esc(it.Title)}</span></div><div class="small">${esc(it.ItemName)}</div><div class="muted small">[${esc(it.Category || '分類なし')}] ${esc(it.Spec)}${it.Unit ? '(' + esc(it.Unit) + ')' : ''}</div></div></button>`).join('')}</div>`;
@@ -10802,20 +10807,38 @@ const bookStore = () => LS.get('f_book', {});
 function savedBook(session = S.session) {
   const b = bookStore()[session]; if (!b || !b.items) return null;
   const map = new Map(); for (const [code, name, spec, unit, qty] of b.items) map.set(code, { code, name, spec, unit, qty });
-  return { map, at: b.at, name: b.name, n: b.items.length };
+  if (b.flagOnly) map.flagOnly = true;
+  return { map, at: b.at, name: b.name, n: b.items.length, flagOnly: !!b.flagOnly };
 }
 function saveBook(map, name) {
   const all = bookStore();
-  all[S.session] = { at: nowIso(), name: name || '貼り付け', items: [...map.values()].map(b => [b.code, b.name, b.spec, b.unit, b.qty]) };
+  all[S.session] = { at: nowIso(), name: name || '貼り付け', flagOnly: !!map.flagOnly, items: [...map.values()].map(b => [b.code, b.name, b.spec, b.unit, b.qty]) };
   LS.set('f_book', all);
 }
 function clearBook() { const all = bookStore(); delete all[S.session]; LS.set('f_book', all); }
 /* 帳簿にある(帳簿が0以外)のに、品目マスタにない・棚卸対象外で、QRを読んでも登録できない品目 */
-function bookNotCountable(map) { const m = master(); return [...map.values()].filter(b => b.qty !== 0 && !(m[b.code] && m[b.code].CountTarget)).map(b => ({ ...b, why: m[b.code] ? '棚卸対象外' : 'マスタにない' })); }
+function bookNotCountable(map) { const m = master(); return [...map.values()].filter(b => b.qty !== 0 && !isTarget(m[b.code]) && targetPrefixes().some(px => b.code.toUpperCase().startsWith(px))).map(b => ({ ...b, why: !m[b.code] ? 'マスタにない' : isHidden(m[b.code]) ? 'GENで非表示' : '棚卸対象外' })); }
 /* GEN取込に出す品目(v3.0): 帳簿にあって、差異なし・修正済、または 修正済・差異あり で理由がある品目。
    差異あり(まだ直していない)は設定でオンにした時だけ、未カウントは「0で出力」をオンにした時だけ。再修正中は出さない */
 const aggOut = r => { const o = S.agg.opt; return r.inBook && (r.st === '差異なし' || r.st === '修正済' || (r.st === '修正済・差異あり' && !!r.reason) || (r.st === '差異あり' && o.incDiff) || (r.st === '未カウント' && o.zeroUncounted)); };
-const needWhy = r => r.st === '再修正中' ? `再修正の数が届くのを待っています(第${r.req}回)`
+/* 集約CSV(v3.2): 旧Excel「棚卸用紙(スマホ集計用)」の集計シートと同じ書式(= GEN の棚卸登録の取込書式)。
+   棚卸対象の全品目(数えていない品目は 0)+ 数えた品目を、品目コード順に並べる。
+   GEN にない品目(帳簿になく、品目マスタで「GENにない」)は GEN に取り込めないので入れない */
+const GEN_HEAD = ['棚卸日', '品目コード (品目)', 'ロケーションコード (ロケーション)', '製番(ロット品目の場合は「製番」列にロット番号を入力してください)', '棚卸数'];
+function shuRows() {
+  const R = S.agg.result, m = master(), list = R ? R.rows : [], by = new Map(list.map(r => [r.code, r]));
+  const codes = new Set(Object.values(m).filter(isTarget).map(x => x.Title));
+  for (const r of list) if (r.n > 0) codes.add(r.code);
+  const rows = [], excluded = [];
+  for (const code of [...codes].sort()) {
+    const r = by.get(code), it = m[code];
+    if (!((r && r.inBook) || (it && it.InGen))) { excluded.push(code); continue; }
+    rows.push({ code, qty: r ? r.qty : 0 });
+  }
+  return { rows, excluded };
+}
+const needWhy = r => !FEATURE_RECOUNT ? (r.st === '差異あり' ? '帳簿と差がある → 紙で再カウントし、集約CSVで直す' : r.st === '未カウント' ? '在庫があるのに登録がない(集約CSVでは 0)→ 確認して集約CSVで直す' : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : '')
+  : r.st === '再修正中' ? `再修正の数が届くのを待っています(第${r.req}回)`
   : r.st === '修正済・差異あり' && !r.reason ? '修正後も帳簿と差があります。理由を入れると GEN取込に出ます(「数を直す・確定」)'
   : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : r.st === '未カウント' ? '数えていない。再修正に入れるか、在庫0なら設定で0出力'
   : r.st === '差異あり' ? '帳簿と差がある。再修正に入れるか、「数を直す・確定」で確定' : '';
@@ -10851,7 +10874,8 @@ function notices() {
   if (!S.session || !S.user.name) out.push(`棚卸回と担当者の名前を設定してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
   else if (!normSession(S.session)) out.push(`棚卸回「${esc(S.session)}」は古い形式です。設定で <b>年-月</b>(例 2026-11)に直してください。<button class="btn sm" data-go="setting">設定を開く</button>`);
   if (rcReq() && !S.rcMode && rcLeft()) out.push(`再修正の依頼が届いています(残り ${rcLeft()}品目)。<button class="btn sm" data-go="recount">再修正を開く</button>`);
-  if (!masterCount()) out.push(`品目マスタが入っていません。管理者が Teams に置いた「品目マスタ_….csv」を読み込んでください。<button class="btn sm" data-act="masterIn">マスタCSVを読み込む</button>`);
+  if (!masterCount()) out.push(`品目マスタが入っていません。管理者が配った「品目マスタ_….csv」を読み込んでください。<button class="btn sm" data-act="masterIn">マスタCSVを読み込む</button>`);
+  else if (S.session && !savedBook()) out.push(`在庫リストが入っていません。管理者が配った「在庫リスト_….csv」を読み込んでください(数は画面に出ません)。<button class="btn sm" data-act="stockIn">在庫リストを読み込む</button>`);
   const u = unexported();
   if (u.length) {
     const oldest = u.map(e => e.ScannedAt).sort()[0], h = (Date.now() - new Date(oldest)) / 36e5;
@@ -10861,7 +10885,7 @@ function notices() {
 }
 function tabs() {
   const t = [['scan', '読取', ICON.scan], ['history', '履歴', ICON.hist], ['export', '書き出し', ICON.out, unexported().length], ...(rcReq() ? [['recount', '再修正', ICON.rc, rcLeft()]] : []), ['master', 'マスタ', ICON.mst], ['setting', '設定', ICON.set]];
-  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting' }[S.screen] || S.screen;
+  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting', todo: 'scan' }[S.screen] || S.screen;
   return `<nav class="tabs" aria-label="画面"><div class="in">${t.map(([k, l, ic, b]) => `<button data-go="${k}" ${cur === k ? 'aria-current="page"' : ''}>${ic}${b ? `<span class="badge">${b}</span>` : ''}<span>${l}</span></button>`).join('')}</div></nav>`;
 }
 function scrScan() {
@@ -10887,7 +10911,7 @@ function scrScan() {
       <button class="btn primary big" data-act="camOpen" style="flex:1.2">カメラで読む</button>
       <input type="text" id="codeIn" placeholder="品目コード または 品名で探す" value="${esc(S.codeQuery || S.code)}" autocapitalize="off" autocomplete="off" enterkeyhint="search" aria-label="品目コード または 品名">
     </div>
-    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="photoScan">写真で読む(カメラが真っ暗な時)</button></div>
+    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="photoScan">写真で読む(カメラが真っ暗な時)</button>${savedBook() && !rcm ? `<button class="btn sm" data-go="todo">在庫がある品目の一覧(未登録 ${todoItems().left.length})</button>` : ''}</div>
     <div id="sugg">${S.codeQuery ? suggHtml(S.codeQuery) : ''}</div>
     ${it ? `
     ${ps.length > 1 || it.Packs ? `<div class="field"><label for="packSel">荷姿</label><select id="packSel">${ps.map((x, i) => `<option value="${i}" ${i === S.packIdx ? 'selected' : ''}>${esc(x.n)}${x.f !== 1 ? '(×' + fmtN(x.f) + ')' : ''}</option>`).join('')}</select></div>` : ''}
@@ -10915,6 +10939,25 @@ function scrHistory() {
         <div style="text-align:right"><div class="n">${e.Factor !== 1 ? `${fmtN(e.InputQty)} × ${esc(e.PackName)} = ${fmtN(e.Qty)}` : fmtN(e.Qty)} ${esc(u)}</div>
         ${!v && !done ? `<button class="btn danger sm ${S.armed === e.Title ? 'armed' : ''}" data-void="${esc(e.Title)}" style="margin-top:6px">${S.armed === e.Title ? 'もう一度押すと取消' : '取消'}</button>` : ''}</div></div>`; }).join('')}</div>`
     : '<p class="muted">まだ登録はありません。</p>'}
+  </main>`;
+}
+/* 在庫がある品目の一覧(v3.2・担当者の端末): 在庫リストで理論在庫が0以外の、棚卸対象の品目のうち、この端末でまだ登録していない品目。
+   数え忘れを防ぐため。理論在庫の数は出さない(数に引っぱられないように) */
+function todoItems() {
+  const sb = savedBook(), m = master(); if (!sb) return { all: [], left: [] };
+  const L = sessionLog(), vd = voidedIds(L), done = new Set(L.filter(e => e.EntryType !== 'void' && !vd.has(e.Title)).map(e => e.ItemCode));
+  const all = [...sb.map.values()].filter(b => b.qty !== 0 && isTarget(m[b.code])).map(b => m[b.code]).sort((a, b) => a.Title.localeCompare(b.Title));
+  return { all, left: all.filter(it => !done.has(it.Title)) };
+}
+function scrTodo() {
+  const T = todoItems(), q = String(S.todoQ || '').trim();
+  const list = q ? fuzzyFind(q, T.left, T.left.length) : T.left;
+  return bar('在庫がある品目の一覧') + `<main>
+    <button class="btn sm" data-go="scan">← 読取へ</button>
+    <div class="kv" style="margin-top:8px"><div><span>在庫がある品目</span><b>${T.all.length}</b></div><div><span>この端末で登録済み</span><b>${T.all.length - T.left.length}</b></div><div><span>未登録</span><b>${T.left.length}</b></div></div>
+    <p class="muted small">在庫リストで在庫がある(棚卸対象の)品目のうち、<b>この端末で</b>まだ登録していない品目です。ほかの人が数えた品目も、ここでは未登録に出ます。担当の場所の数え忘れの確認に使ってください。数は表示しません。品目を押すと登録画面になります。</p>
+    <div class="field"><input type="text" id="todoQ" placeholder="コード・品名で絞り込み" value="${esc(S.todoQ || '')}" aria-label="絞り込み"></div>
+    ${list.length ? `<div class="list">${list.slice(0, 300).map(it => `<button class="item" data-tpick="${esc(it.Title)}"><div class="main"><div><span class="c">${esc(it.Title)}</span></div><div class="small">${esc(it.ItemName)}</div><div class="muted small">[${esc(it.Category || '分類なし')}] ${esc(it.Spec)}${it.Unit ? '(' + esc(it.Unit) + ')' : ''}</div></div></button>`).join('')}</div>${list.length > 300 ? `<p class="muted small">ほか ${list.length - 300}品目(絞り込んでください)</p>` : ''}` : `<p class="small" style="color:var(--good)">${T.all.length ? '在庫がある品目は、すべてこの端末で登録済みです。' : '在庫がある棚卸対象の品目はありません。'}</p>`}
   </main>`;
 }
 /* 再修正(v3.0・再カウント担当の端末): 管理者から届いた再修正データを読み込み、対象の品目だけを数え直す */
@@ -10994,15 +11037,16 @@ function scrExport() {
 }
 function scrMaster() {
   const M = S.master, rows = Object.values(master()).sort((a, b) => a.Title.localeCompare(b.Title)), pend = mlog().filter(l => l.GenStatus === '未反映'), pendCodes = new Set(pend.map(l => l.ItemCode));
-  const F = { '棚卸対象': r => r.CountTarget, '対象外': r => !r.CountTarget, 'GEN反映待ち': r => pendCodes.has(r.Title), 'GENにない': r => !r.InGen, 'アプリで追加': r => r.Source === 'APP', 'すべて': () => true };
+  const F = { '棚卸対象': r => isTarget(r), '対象外': r => !isTarget(r), 'GEN反映待ち': r => pendCodes.has(r.Title), 'GENにない': r => !r.InGen, 'アプリで追加': r => r.Source === 'APP', 'すべて': () => true };
   const base = rows.filter(F[M.filter] || F['すべて']);
   const shown = String(M.q || '').trim() ? fuzzyFind(M.q, base, base.length) : base;   // v2.4: あいまい検索(一致度の高い順)
   return bar('品目マスタ') + `<main>
     ${M.err ? `<div class="err">${esc(M.err)}</div>` : ''}
-    <p class="muted small">この端末のマスタ: ${rows.length}件(${esc(LS.get('f_master_at', '未読込'))})</p>
-    ${!rows.length ? `<div class="note">品目マスタが入っていません。管理者が指定した Teams のフォルダにある最新の <b>品目マスタ_….csv</b> を「マスタCSVを読み込む」で読み込んでください。</div>` : ''}
-    <div class="row"><button class="btn primary" data-go="masterImport">GENから更新</button><button class="btn" data-act="newItem">新規登録</button></div>
-    <div class="row" style="margin-top:8px"><button class="btn" data-act="masterOut">マスタCSVを書き出す</button><button class="btn" data-act="masterIn">マスタCSVを読み込む</button></div>
+    <p class="muted small">この端末のマスタ: ${rows.length}件(${esc(LS.get('f_master_at', '未読込'))})/ 在庫リスト: ${(() => { const sb = savedBook(); return sb ? `${sb.n}品目(${esc(sb.name)})` : '未読込'; })()}</p>
+    ${!rows.length ? `<div class="note">品目マスタが入っていません。管理者が配った最新の <b>品目マスタ_….csv</b> を「マスタCSVを読み込む」で読み込んでください。</div>` : ''}
+    <div class="row"><button class="btn primary" data-act="masterIn">マスタCSVを読み込む</button><button class="btn primary" data-act="stockIn">在庫リストを読み込む</button></div>
+    <p class="muted small" style="margin-top:4px">どちらも管理者が配ったファイル(<code>品目マスタ_….csv</code> と <code>在庫リスト_….csv</code>)を選びます。在庫リストの数は画面に出ません。</p>
+    <div class="row" style="margin-top:8px"><button class="btn" data-act="masterOut">マスタCSVを書き出す</button><button class="btn" data-go="masterImport">GENから更新</button><button class="btn" data-act="newItem">新規登録</button></div>
     <p class="muted small">管理者の端末で「書き出す」→ 所定フォルダに保存 → 他の端末で「読み込む」で全員のマスタをそろえます。読み込みは統合なので、この端末で追加・変更してまだ管理者に渡していない品目は消えません。この端末での変更は、カウントの「CSVを書き出す」と一緒に「マスタ変更CSV」として管理者に渡ります。</p>
     <button class="btn block ${pend.length ? 'signal' : ''}" data-act="togglePending" style="margin-top:4px">GEN反映待ち(${pend.length})</button>
     ${M.pending ? `<div class="panel">${pend.length ? `<table class="diff"><tr><th>品目</th><th>変更内容</th><th>変更者</th></tr>${pend.map(l => `<tr><td>${esc(l.ItemCode)}<br><span class="muted">${esc(l.Action)}</span></td><td>${esc(l.Changes)}</td><td>${esc(l.ActionBy)}<br><span class="muted">${fmtT(l.ActionAt)}</span></td></tr>`).join('')}</table>
@@ -11012,7 +11056,7 @@ function scrMaster() {
     <div class="field"><input type="text" id="mq" placeholder="コード・品名・規格で検索" value="${esc(M.q)}" aria-label="検索"></div>
     <div class="chips" role="group" style="margin-top:8px">${Object.keys(F).map(k => `<button class="chip" data-mf="${k}" aria-pressed="${M.filter === k}">${k}<span class="k">${rows.filter(F[k]).length}</span></button>`).join('')}</div>
     ${shown.length ? `<div class="list">${shown.slice(0, M.limit).map(r => `<button class="item" data-mi="${esc(r.Title)}"><div class="main">
-      <div><span class="c">${esc(r.Title)}</span> ${!r.CountTarget ? '<span class="pill">対象外</span>' : ''}${!r.InGen ? ' <span class="pill bad">GENにない</span>' : ''}${pendCodes.has(r.Title) ? ' <span class="pill warn">GEN反映待ち</span>' : ''}${r.Source === 'APP' ? ' <span class="pill">アプリで追加</span>' : ''}</div>
+      <div><span class="c">${esc(r.Title)}</span> ${!isTarget(r) ? '<span class="pill">対象外</span>' : ''}${!r.InGen ? ' <span class="pill bad">GENにない</span>' : ''}${pendCodes.has(r.Title) ? ' <span class="pill warn">GEN反映待ち</span>' : ''}${r.Source === 'APP' ? ' <span class="pill">アプリで追加</span>' : ''}</div>
       <div class="small">${esc(r.ItemName)}</div><div class="muted small">[${esc(r.Category || '分類なし')}] ${esc(r.Spec)}${r.Unit ? '(' + esc(r.Unit) + ')' : ''}</div></div></button>`).join('')}</div>
       ${shown.length > M.limit ? `<button class="btn block" data-act="more" style="margin-top:8px">さらに表示(残り ${shown.length - M.limit}件)</button>` : ''}` : '<p class="muted">該当する品目はありません。</p>'}
   </main>`;
@@ -11027,7 +11071,8 @@ function scrMasterEdit() {
     <div class="row"><div class="field"><label for="fSpec">規格 ★</label><input type="text" id="fSpec" value="${esc(f.Spec)}"></div><div class="field"><label for="fUnit">管理単位 ★</label><input type="text" id="fUnit" value="${esc(f.Unit)}"></div></div>
     <div class="field"><label for="fCat">分類</label><input type="text" id="fCat" value="${esc(f.Category)}" list="catList"><datalist id="catList">${[...new Set(Object.values(master()).map(r => r.Category).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>
     <div class="field"><label for="fPacks">荷姿と入数(例 パレット(36箱):36;バラ(箱):1)</label><input type="text" id="fPacks" value="${esc(f.Packs)}"></div>
-    <label class="toggle" style="margin-top:8px"><input type="checkbox" id="fTarget" ${f.CountTarget ? 'checked' : ''}> 棚卸対象</label>
+    <input type="checkbox" id="fTarget" hidden ${f.CountTarget ? 'checked' : ''}>
+    <p class="small" style="margin-top:8px">棚卸対象: <b>${f.Title ? (isTarget({ ...(master()[f.Title] || {}), Title: f.Title, Source: master()[f.Title]?.Source || 'APP' }) ? 'はい' : 'いいえ') : '(コードを入れると判定)'}</b><span class="muted">(品目コードの頭文字で自動。今の対象: ${esc(targetPrefixes().join('・'))}。変えるのは 設定 →「棚卸対象のコード」)</span></p>
     <p class="muted small">★の項目を変えると「GEN反映待ち」になり、GENから更新しても上書きされません。</p>
     <button class="btn primary big block" data-act="saveItem" style="margin-top:12px">${e.isNew ? '登録する' : '保存する'}</button>
     ${!e.isNew && e.logs?.length ? `<h2>変更履歴</h2><table class="diff">${e.logs.map(l => `<tr><td>${fmtT(l.ActionAt)}<br><span class="muted">${esc(l.ActionBy)}</span></td><td>${esc(l.Action)}<br><span class="muted">${esc(l.GenStatus)}</span></td><td>${esc(l.Changes)}</td></tr>`).join('')}</table>` : ''}
@@ -11037,11 +11082,9 @@ function scrMasterImport() {
   const I = S.imp, p = I.preview;
   return bar('GENから品目マスタを更新') + `<main>
     <button class="btn sm" data-go="master">← 品目マスタへ</button>
-    <button class="btn primary block big" data-act="genFetch" style="margin-top:10px">GENのAPIから取得</button>
-    <p class="muted small">取得した内容が下の欄に入り「全品目」がオンになります。APIの設定とトークンは設定画面です。APIが使えない時は、GENのエクセル出力(B〜G列)や「GEN品目マスタ取得.ps1」の結果を貼り付けてください(列の位置: ${esc(cfgVal('ImportColumns', '1,2,3,6,4'))})。</p>
+    <div class="note"><b>ふだんは、管理者のPCの「棚卸データ準備.bat」を使います。</b>GEN の API から取得して <code>品目マスタ_….csv</code> を作るので、それを マスタ →「マスタCSVを読み込む」で読み込むだけです。<br>この画面は、GENのエクセル出力(棚卸登録の B〜G列など)を貼り付けて更新したい時に使います(列の位置: ${esc(cfgVal('ImportColumns', '1,2,3,6,4'))})。</div>
     <textarea id="impText" placeholder="ここに貼り付け" aria-label="貼り付け">${esc(I.text)}</textarea>
     <label class="toggle"><input type="checkbox" id="impAll" ${I.all ? 'checked' : ''}> 全品目(貼り付けにない品目に「GENにない」の印を付ける)</label>
-    <label class="toggle"><input type="checkbox" id="impNewT" ${I.newTarget ? 'checked' : ''}> 新規の品目を棚卸対象にする</label>
     ${I.err ? `<div class="err">${esc(I.err)}</div>` : ''}
     <button class="btn block" data-act="impPreview" style="margin-top:8px">内容を確認</button>
     ${p ? `<h2>確認結果</h2>
@@ -11055,7 +11098,7 @@ function scrMasterImport() {
 }
 function scrAgg() {
   const A = S.agg, o = A.opt, R = A.result, book = A.book;
-  const F = ['すべて', '要対応', '差異あり', '未カウント', '再修正中', '修正済・差異あり', '修正済', '帳簿なし', '差異なし'];
+  const F = FEATURE_RECOUNT ? ['すべて', '要対応', '差異あり', '未カウント', '再修正中', '修正済・差異あり', '修正済', '帳簿なし', '差異なし'] : ['すべて', '差異あり', '未カウント', '帳簿なし', '差異なし'];
   const need = r => !aggOut(r);
   const shown = R ? R.rows.filter(r => A.filter === 'すべて' ? true : A.filter === '要対応' ? need(r) : r.st === A.filter) : [];
   const cnt = k => R ? (k === 'すべて' ? R.rows.length : k === '要対応' ? R.rows.filter(need).length : R.rows.filter(r => r.st === k).length) : 0;
@@ -11073,17 +11116,17 @@ function scrAgg() {
         <p class="muted small">取り込むと、品目名・規格・単位の変更は「GEN反映待ち」になります(マスタ画面から GEN品目マスタCSV を作成)。そのあと「マスタCSVを書き出す」で全員に配ってください。</p>
       </div>` : ''}
     <h2>2. 帳簿在庫(GENの棚卸登録のエクセル出力 B〜G列)</h2>
-    ${(() => { const sb = savedBook(); return sb ? `<p class="small">棚卸の前に読み込んだ帳簿在庫を使います: ${sb.n}品目・${esc(sb.name)}・${fmtT(sb.at)}(読み直す時は下のボタン、または 設定 →「帳簿在庫」)</p>` : `<p class="muted small">棚卸の前に 設定 →「帳簿在庫」で読み込んでおくと、ここは自動で入ります。</p>`; })()}
+    ${(() => { const sb = savedBook(); return sb && sb.flagOnly ? `<div class="err">このPCに入っている在庫リスト(${esc(sb.name)})は<b>配布用(数なし)</b>なので照合に使えません。下の「ファイルを選ぶ」で <b>在庫リスト_管理者用_….csv</b> を読み込んでください。</div>` : sb ? `<p class="small">棚卸の前に読み込んだ在庫リストを使います: ${sb.n}品目・${esc(sb.name)}・${fmtT(sb.at)}(読み直す時は下のボタン)</p>` : `<p class="muted small">下の「ファイルを選ぶ」で <b>在庫リスト_管理者用_….csv</b> を読み込みます(棚卸の前に読み込んでおくと自動で入ります)。</p>`; })()}
     <div class="row"><button class="btn" data-act="aggBookFile">ファイルを選ぶ(CSV/TSV)</button><button class="btn" data-act="aggBookPaste">${A.bookText ? '貼り付けを編集' : '貼り付ける'}</button></div>
     ${A.showBook ? `<textarea id="aggBook" placeholder="GENのエクセル出力をコピーして貼り付け(列の位置は設定 ImportColumns)">${esc(A.bookText)}</textarea><button class="btn block" data-act="aggBookApply" style="margin-top:6px">帳簿在庫を取り込む</button>` : ''}
     <p class="muted small">${book ? `帳簿 ${book.size}品目を取り込み済み` : '未取り込み(帳簿なしでも合計だけは出せます)'}</p>
-    <h2>3. GEN取込の設定</h2>
+    <h2>3. 集約CSVの設定</h2>
     <div class="panel">
       <div class="row"><div class="field" style="margin-top:0"><label for="agDate">棚卸日</label><input type="date" id="agDate" value="${esc(o.date)}"></div>
       <div class="field" style="margin-top:0"><label for="agLoc">ロケーションコード</label><input type="text" id="agLoc" value="${esc(o.loc)}"></div></div>
-      <label class="toggle"><input type="checkbox" id="agInc" ${o.incDiff ? 'checked' : ''}> 帳簿と差があり、まだ直していない品目も実在庫で出力する(通常はオフ。オフなら要対応へ)</label>
-      <label class="toggle"><input type="checkbox" id="agZero" ${o.zeroUncounted ? 'checked' : ''}> 帳簿にあるのに登録がない品目を 0 で出力する</label>
-      <div class="field"><label for="agEnc">GENに取り込むCSVの文字コード</label><select id="agEnc">
+      ${FEATURE_RECOUNT ? `<label class="toggle"><input type="checkbox" id="agInc" ${o.incDiff ? 'checked' : ''}> 帳簿と差があり、まだ直していない品目も実在庫で出力する(通常はオフ。オフなら要対応へ)</label>
+      <label class="toggle"><input type="checkbox" id="agZero" ${o.zeroUncounted ? 'checked' : ''}> 帳簿にあるのに登録がない品目を 0 で出力する</label>` : `<input type="checkbox" id="agInc" hidden ${o.incDiff ? 'checked' : ''}><input type="checkbox" id="agZero" hidden ${o.zeroUncounted ? 'checked' : ''}>`}
+      <div class="field"><label for="agEnc">集約CSVの文字コード</label><select id="agEnc">
         <option value="sjis" ${(o.enc || 'sjis') === 'sjis' ? 'selected' : ''}>Shift-JIS(Excel で保存したCSVと同じ。従来の運用)</option>
         <option value="utf8" ${o.enc === 'utf8' ? 'selected' : ''}>UTF-8(BOM付き)</option></select>
         <p class="muted small">GENで見出しや品名が文字化けする・取り込めない時は切り替えてください。GEN取込CSVと GEN品目マスタCSV に使います(要対応CSV・集計CSVは UTF-8)。</p></div>
@@ -11091,19 +11134,22 @@ function scrAgg() {
     <button class="btn primary big block" data-act="aggRun" style="margin-top:12px" ${A.rows.length ? '' : 'disabled'}>集計する</button>
     ${R ? `<h2>結果(${R.rows.length}品目・明細 ${R.n}件・${fmtT(R.at)})</h2>
       ${R.late ? `<div class="note">再修正の後に届いた初回の明細 ${R.late}件は使っていません(再修正した品目は、修正後の数に置き換わります)。</div>` : ''}
-      <div class="stack"><button class="btn primary block" data-act="aggExGen">GEN取込CSVをダウンロード(${R.rows.filter(aggOut).length}品目)</button>
-      <div class="row"><button class="btn" data-act="aggExNeed">要対応CSV(${cnt('要対応')})</button><button class="btn" data-act="aggExAll">集計CSV(全品目)</button></div></div>
-      <h2>4. 差異の修正</h2>
+      ${FEATURE_RECOUNT ? `<div class="stack"><button class="btn primary block" data-act="aggExGen">GEN取込CSVをダウンロード(${R.rows.filter(aggOut).length}品目)</button>
+      <div class="row"><button class="btn" data-act="aggExNeed">要対応CSV(${cnt('要対応')})</button><button class="btn" data-act="aggExAll">集計CSV(全品目)</button></div></div>`
+      : `<div class="stack"><button class="btn primary big block" data-act="aggExShu">集約CSVをダウンロード(${shuRows().rows.length}品目)</button>
+      <p class="muted small" style="margin:0">集計シートと同じ書式(棚卸日・品目コード・ロケーションコード・製番・棚卸数)。<b>棚卸対象の全品目</b>を品目コード順に並べ、数えていない品目は 0。同じ内容の「…_修正前.csv」も一緒に保存されます(直した品目の記録に使うので、こちらは直さない)。差異は紙で再カウントし、<b>集約CSVを Excel で直接直して</b>から「集約CSVをGEN用に整える.bat」に通して GEN に取り込みます。</p>
+      <div class="row"><button class="btn" data-act="aggExNeed">差異リスト(紙の再カウント用・${R.rows.filter(r => ['差異あり', '未カウント', '帳簿なし'].includes(r.st)).length})</button><button class="btn" data-act="aggExAll">集計CSV(全品目・詳しい)</button></div></div>`}
+      ${FEATURE_RECOUNT ? `<h2>4. 差異の修正</h2>
       <div class="panel stack">
         <p class="muted small" style="margin:0">帳簿と差がある品目を、①「再修正データ」にして担当者に数え直してもらう(数量・帳簿は入れません)か、② 品目をクリックして「数を直す・確定」でこのPCで直します。数え直した担当者のCSVを選び直して「集計する」と、修正後の数に置き換わります。</p>
         <div class="row"><button class="btn" data-act="rcAddDiff">差異あり・未カウントを再修正に入れる</button><button class="btn primary" data-act="rcExport" ${R.rows.some(r => r.st === '再修正中') ? '' : 'disabled'}>再修正データを書き出す(${cnt('再修正中')}品目)</button></div>
         <div class="row"><button class="btn" data-act="aggExRec">差異修正記録CSV</button><button class="btn danger ${S.armed === 'rcReqClear' ? 'armed' : ''}" data-act="rcReqClear" ${Object.keys(reqOf()).length ? '' : 'disabled'}>${S.armed === 'rcReqClear' ? 'もう一度押すと外します' : '再修正の依頼を全部外す'}</button></div>
-      </div>
+      </div>` : `<h2>4. 差異の確認</h2>`}
       <div class="chips" role="group" style="margin-top:10px">${F.map(k => `<button class="chip" data-af="${k}" aria-pressed="${A.filter === k}">${k}<span class="k">${cnt(k)}</span></button>`).join('')}</div>
-      ${shown.length ? `<div class="list">${shown.map(r => `<div class="item" data-ao="${esc(r.code)}"><div class="main">
-        <div><span class="c">${esc(r.code)}</span> <span class="pill ${({ '差異なし': 'ok', '修正済': 'ok', '差異あり': 'bad', '修正済・差異あり': 'bad', '帳簿なし': 'bad', '未カウント': 'warn', '再修正中': 'warn' })[r.st] || ''}">${esc(r.st)}</span>${aggOut(r) ? '' : ' <span class="pill">GEN取込に出ない</span>'}${r.method ? ` <span class="pill">${esc(r.method)}</span>` : ''}${r.reason ? ` <span class="pill">理由: ${esc(r.reason)}</span>` : ''}</div>
+      ${shown.length ? `<div class="list">${shown.map(r => `<div class="item" ${FEATURE_RECOUNT ? `data-ao="${esc(r.code)}"` : 'style="cursor:default"'}><div class="main">
+        <div><span class="c">${esc(r.code)}</span> <span class="pill ${({ '差異なし': 'ok', '修正済': 'ok', '差異あり': 'bad', '修正済・差異あり': 'bad', '帳簿なし': 'bad', '未カウント': 'warn', '再修正中': 'warn' })[r.st] || ''}">${esc(r.st)}</span>${FEATURE_RECOUNT && !aggOut(r) ? ' <span class="pill">GEN取込に出ない</span>' : ''}${r.method ? ` <span class="pill">${esc(r.method)}</span>` : ''}${r.reason ? ` <span class="pill">理由: ${esc(r.reason)}</span>` : ''}</div>
         <div class="small">${esc(r.name)}</div><div class="muted small">帳簿 ${fmtN(r.book)}・${r.method ? `初回 ${fmtN(r.first)} → ` : ''}実在庫 ${fmtN(r.qty)}${r.unit ? ' ' + esc(r.unit) : ''}・${r.n}件${r.v ? '(取消 ' + r.v + ')' : ''}${r.who ? '・' + esc(r.who) : ''}${r.loc ? '・' + esc(r.loc) : ''}</div>
-        ${needWhy(r) && !aggOut(r) ? `<div class="small" style="color:var(--bad)">${esc(needWhy(r))}</div>` : ''}</div>
+        ${needWhy(r) && (!FEATURE_RECOUNT || !aggOut(r)) ? `<div class="small" style="color:var(--bad)">${esc(needWhy(r))}</div>` : ''}</div>
         <div class="n">${r.diff > 0 ? '+' : ''}${fmtN(r.diff)}</div></div>${A.open === r.code ? aggDetail(r) : ''}`).join('')}</div>` : '<p class="muted">該当なし</p>'}` : ''}
   </main>`;
 }
@@ -11132,9 +11178,9 @@ function scrBook() {
   const sb = savedBook(), U = S.bookUi;
   const nz = sb ? [...sb.map.values()].filter(b => b.qty !== 0).length : 0;
   const ng = sb ? bookNotCountable(sb.map) : [];
-  return bar('帳簿在庫(棚卸の前に)') + `<main>
+  return bar('在庫リスト(帳簿在庫)') + `<main>
     <button class="btn sm" data-go="setting">← 設定へ</button>
-    <p class="muted small">GENの「棚卸登録」画面のエクセル出力(B〜G列)を、<b>棚卸を始める前に</b>このPCに読み込んでおきます。棚卸回ごとに保存され、集計の時に自動で使われます。担当者の端末には配りません(数える人が帳簿の数を見ないようにするため)。</p>
+    <p class="muted small">管理者が配る <code>在庫リスト_….csv</code>(GEN の在庫リストのエクセル出力を、管理者のツールで変換したもの)を、<b>棚卸を始める前に</b>読み込みます。棚卸回ごとに保存され、担当者の端末では「在庫がある品目の一覧」(数え忘れの確認)に、管理者のPCでは集計の照合に使われます。<b>理論在庫の数は、この画面にも読取画面にも出しません</b>(数える人が数に引っぱられないように)。GEN の棚卸登録のエクセル出力(B〜G列)を貼り付けても読めます。</p>
     <div class="panel">
       <div><b>棚卸回: ${esc(S.session || '未設定')}</b></div>
       ${sb ? `<p class="small" style="margin-top:4px">読み込み済み: <b>${sb.n}品目</b>(帳簿が0以外 ${nz}品目)・${esc(sb.name)}・${fmtT(sb.at)}</p>` : '<p class="small" style="margin-top:4px">まだ読み込んでいません</p>'}
@@ -11146,10 +11192,10 @@ function scrBook() {
     ${sb ? `
       ${ng.length ? `<h2>注意: QRを読んでも登録できない品目(${ng.length}品目)</h2>
         <div class="note">帳簿にある(0以外)のに、この端末の品目マスタにない・棚卸対象外のため、現場で登録できず「未カウント」になります。品目マスタに追加するか「棚卸対象」にして、マスタCSVを配り直してください。</div>
-        <table class="diff"><tr><th>品目コード</th><th>品名</th><th>帳簿</th><th>理由</th></tr>${ng.slice(0, 100).map(b => `<tr><td>${esc(b.code)}</td><td>${esc(b.name)}</td><td style="text-align:right">${fmtN(b.qty)}</td><td>${esc(b.why)}</td></tr>`).join('')}</table>`
+        <table class="diff"><tr><th>品目コード</th><th>品名</th><th>理由</th></tr>${ng.slice(0, 100).map(b => `<tr><td>${esc(b.code)}</td><td>${esc(b.name)}</td><td>${esc(b.why)}</td></tr>`).join('')}</table>`
         : `<p class="small" style="color:var(--good)">帳簿にある品目(0以外)は、すべて品目マスタの棚卸対象に入っています。</p>`}
       <h2>内容(先頭50品目)</h2>
-      <table class="diff"><tr><th>品目コード</th><th>品名</th><th>帳簿</th></tr>${[...sb.map.values()].slice(0, 50).map(b => `<tr><td>${esc(b.code)}</td><td>${esc(b.name)}<br><span class="muted">${esc(b.spec)} ${esc(b.unit)}</span></td><td style="text-align:right">${fmtN(b.qty)}</td></tr>`).join('')}</table>
+      <table class="diff"><tr><th>品目コード</th><th>品名</th></tr>${[...sb.map.values()].slice(0, 50).map(b => `<tr><td>${esc(b.code)}</td><td>${esc(b.name)}<br><span class="muted">${esc(b.spec)} ${esc(b.unit)}</span></td></tr>`).join('')}</table>
       <button class="btn danger block ${S.armed === 'clearBook' ? 'armed' : ''}" data-act="clearBook" style="margin-top:12px">${S.armed === 'clearBook' ? 'もう一度押すと消します' : 'この棚卸回の帳簿在庫を消す'}</button>` : ''}
   </main>`;
 }
@@ -11164,27 +11210,34 @@ function scrSetting() {
       <div class="field"><label for="mailIn">メール(任意)</label><input type="email" id="mailIn" value="${esc(S.user.email)}" autocomplete="off"></div>
       <button class="btn primary block" data-act="saveBasic" style="margin-top:10px">保存</button>
     </div>
-    <h2>再修正(数え直しの担当者)</h2>
+    ${FEATURE_RECOUNT ? `<h2>再修正(数え直しの担当者)</h2>
     <div class="stack">
       <button class="btn block" data-act="rcLoad">再修正データを読み込む${rcReq() ? `<span class="muted small">(${rcReq().items.length}品目 読み込み済み)</span>` : ''}</button>
-    </div>
+    </div>` : ''}
     <h2>管理者・PC向け</h2>
     <div class="stack">
       <button class="btn block" data-go="book">帳簿在庫を読み込む(棚卸の前に)${savedBook() ? `<span class="muted small">(${esc(S.session)}: ${savedBook().n}品目 読み込み済み)</span>` : ''}</button>
       <button class="btn block" data-go="agg">全員のCSVを集計してGEN取込CSVを作る</button>
     </div>
-    <h2>GEN API(品目マスタの取得)</h2>
+    <h2>棚卸対象のコード</h2>
     <div class="panel">
-      <div class="field" style="margin-top:0"><label for="genToken">APIトークン(CSVやマスタには入りません)</label><input type="password" id="genToken" value="${esc(getToken())}" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
-      <label class="toggle"><input type="checkbox" id="genTokenKeep" ${LS.get('f_gen_token', '') ? 'checked' : ''}> この端末に保存する(オフ=アプリを閉じると消える。安全のため、共用PCではオフ)</label>
-      ${fld('cUrl', 'URL(トークンをURLに含めるなら {token})', 'GenApiUrl', 'https://…/api/items')}
-      <div class="row">${fld('cHdr', '認証ヘッダーの名前', 'GenApiAuthHeader')}${fld('cFmt', '認証ヘッダーの値の書式', 'GenApiAuthFormat')}</div>
-      ${fld('cList', '一覧が入っている項目名(例 data / data.items。全体が一覧なら空欄)', 'GenApiListPath')}
-      <div class="row">${fld('cFc', '品目コードの項目名', 'GenApiFieldCode')}${fld('cFn', '品目名の項目名', 'GenApiFieldName')}</div>
-      <div class="row">${fld('cFs', '規格の項目名', 'GenApiFieldSpec')}${fld('cFu', '管理単位の項目名', 'GenApiFieldUnit')}</div>
-      ${fld('cImp', '貼り付けデータの列位置(品目コード,品目名,規格,管理単位,理論在庫)', 'ImportColumns')}
-      <button class="btn primary block" data-act="saveCfg" style="margin-top:10px">GEN APIの設定を保存</button>
-      <p class="muted small">設定は「マスタCSVを書き出す」には入りません。各端末で入れるか、設定した端末の値をそろえてください。</p>
+      <p class="small" style="margin-top:0">品目コードの<b>頭文字</b>で棚卸対象を決めます(複数選べます)。GEN で非表示・GEN にない品目は、頭文字が合っていても対象外です。<b>数える人の端末も、管理者と同じにしてください</b>(既定は C・P・O)。</p>
+      <div class="chips" style="flex-wrap:wrap" role="group" aria-label="棚卸対象の頭文字">${(() => {
+        const cur = new Set(targetPrefixes()), cnt = {};
+        for (const it of Object.values(master())) { const h = codeHead(it.Title); if (h) cnt[h] = (cnt[h] || 0) + (isHidden(it) ? 0 : 1); }
+        const heads = [...new Set([...Object.keys(cnt), ...cur])].sort();
+        return heads.map(h => `<label class="chip" style="cursor:pointer"><input type="checkbox" class="tpx" value="${esc(h)}" ${cur.has(h) ? 'checked' : ''}> ${esc(h)}<span class="k">${cnt[h] || 0}</span></label>`).join('');
+      })()}</div>
+      <div class="field"><label for="tpxOther">その他の頭文字(2文字以上も可。カンマ区切り。例 YG)</label><input type="text" id="tpxOther" value="${esc(targetPrefixes().filter(p => p.length > 1).join(','))}" autocapitalize="characters" autocomplete="off"></div>
+      <p class="muted small">今の棚卸対象: <b>${Object.values(master()).filter(isTarget).length}</b> 品目(${esc(targetPrefixes().join('・') || 'なし')})。数字は品目マスタの中の品目数(非表示を除く)。</p>
+      <button class="btn primary block" data-act="saveTarget" style="margin-top:6px">棚卸対象のコードを保存</button>
+    </div>
+    <h2>品目マスタの更新(GEN)</h2>
+    <div class="panel">
+      <p class="small" style="margin-top:0">品目マスタと在庫リストは、<b>管理者のPCの「棚卸データ準備.bat」</b>で作り(品目マスタは GEN の API、在庫リストは GEN のエクセル出力から)、サイボウズで配ります。各端末は マスタ →「<b>マスタCSVを読み込む</b>」「<b>在庫リストを読み込む</b>」で最新になります。</p>
+      <p class="muted small">GEN の API はブラウザ(このアプリ)から直接は呼べないため、端末に APIトークンは入れません。</p>
+      ${fld('cImp', '貼り付けで取り込む時の列位置(品目コード,品目名,規格,管理単位,理論在庫)', 'ImportColumns')}
+      <button class="btn block" data-act="saveCfg" style="margin-top:10px">列位置を保存</button>
     </div>
     <h2>この端末</h2>
     <div class="panel stack">
@@ -11196,7 +11249,7 @@ function scrSetting() {
     </div>
   </main>`;
 }
-const SCREENS = { scan: scrScan, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, setting: scrSetting };
+const SCREENS = { scan: scrScan, todo: scrTodo, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, setting: scrSetting };
 function render() {
   const y = window.scrollY, act = document.activeElement?.id;
   $('#app').innerHTML = (SCREENS[S.screen] || scrScan)() + tabs();
@@ -11205,7 +11258,7 @@ function render() {
 }
 function go(screen) {
   S.armed = null; S.screen = screen;
-  if (screen === 'agg' && !S.agg.book) { const sb = savedBook(); if (sb) S.agg.book = sb.map; }   // 棚卸の前に読み込んだ帳簿在庫を使う
+  if (screen === 'agg' && !S.agg.book) { const sb = savedBook(); if (sb && !sb.flagOnly) S.agg.book = sb.map; }   // 棚卸の前に読み込んだ帳簿在庫を使う(配布用=数なしは照合に使えない)
   if (screen === 'book') S.bookUi.err = '';
   window.scrollTo(0, 0); render();
 }
@@ -11356,6 +11409,12 @@ const ACTIONS = {
   newItem: () => openEdit('', true),
   masterOut: () => exportMaster(),
   masterIn: async () => { try { await importMasterFile(); } catch (e) { toast(e.message, 4000); } render(); },
+  /* v3.2 担当者の端末: 管理者が配った在庫リストを読み込む(数は画面に出さない) */
+  stockIn: async () => { if (!S.session) return toast('先に設定で棚卸回を入れてください'); const f = await pickFile(); if (!f) return;
+    if (/^Title,ItemName/.test(String(f.text).replace(/^﻿/, ''))) return toast('これは品目マスタです。「マスタCSVを読み込む」で読み込んでください', 4500);
+    const map = parseBook(f.text); if (!map.size) return toast('在庫リストの形式ではありません(「品目コード」「理論在庫数」の列が必要)。管理者が配った「在庫リスト_….csv」を選んでください', 5000);
+    saveBook(map, f.name); S.agg.book = map.flagOnly ? null : map; S.agg.result = null;
+    toast(`在庫リスト ${map.size}品目を読み込みました(在庫がある棚卸対象 ${todoItems().all.length}品目)`, 4500); render(); },
   togglePending: () => { S.master.pending = !S.master.pending; render(); },
   more: () => { S.master.limit += 300; render(); },
   saveItem: () => {
@@ -11372,13 +11431,21 @@ const ACTIONS = {
   aggMergeMaster: () => { const n = mergeMasterChanges(); toast(`品目マスタに ${n}件を取り込みました。全員に配るには マスタ →「マスタCSVを書き出す」`, 6000); render(); },
   markSynced: () => { if (S.armed !== 'synced') { S.armed = 'synced'; return render(); } const at = nowIso(); let n = 0;
     saveMlog(mlog().map(l => l.GenStatus === '未反映' ? (n++, { ...l, GenStatus: '反映済', GenSyncedBy: S.user.name, GenSyncedAt: at }) : l)); S.armed = null; toast(`${n}件を反映済にしました`); render(); },
-  genFetch: async () => { busy('GENから取得中…'); S.imp.err = ''; try { S.imp.text = await fetchGenMaster(); S.imp.all = true; S.imp.preview = previewImport(); toast('GENから取得しました'); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } unbusy(); render(); },
   impPreview: () => { S.imp.err = ''; S.imp.text = $('#impText').value; try { S.imp.preview = previewImport(); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } render(); },
   impApply: () => { const p = S.imp.preview; if (!p) return; const s = applyImport(p); S.imp.preview = null; S.imp.text = ''; toast('反映しました: ' + s + '。他の端末に配るには「マスタCSVを書き出す」', 6000); go('master'); },
   saveBasic: () => { const ses = normSession($('#sesIn').value); if (!ses) return toast('棚卸回は「年-月」で入れてください(例 2026-11)', 4000); S.session = ses; S.user = { name: $('#nameIn').value.trim(), email: $('#mailIn').value.trim() }; LS.set('f_session', S.session); LS.set('f_user', S.user); S.exportInfo = null; LS.del('f_export'); S.agg.book = null; S.agg.result = null; toast('保存しました'); render(); },
-  saveCfg: () => { document.querySelectorAll('[data-cfg]').forEach(el => S.cfg[el.dataset.cfg] = el.value.trim()); LS.set('f_cfg', S.cfg); const t = $('#genToken').value.trim(), keep = $('#genTokenKeep').checked; memToken = t; if (t && keep) LS.set('f_gen_token', t); else LS.del('f_gen_token'); toast(t ? (keep ? '保存しました(トークンはこの端末に保存)' : '保存しました(トークンはアプリを閉じると消えます)') : '保存しました'); render(); },
+  saveTarget: () => {
+    const sel = [...document.querySelectorAll('.tpx')].filter(x => x.checked).map(x => x.value);
+    const other = String($('#tpxOther').value || '').normalize('NFKC').toUpperCase().split(/[,、\s]+/).map(s => s.trim()).filter(Boolean);
+    const list = [...new Set([...sel, ...other])];
+    if (!list.length) return toast('棚卸対象の頭文字を1つ以上選んでください');
+    S.cfg.TargetPrefixes = list.join(','); LS.set('f_cfg', S.cfg); S.agg.result = null;
+    toast(`棚卸対象を ${list.join('・')} にしました(${Object.values(master()).filter(isTarget).length}品目)`, 4500); render(); },
+  saveCfg: () => { document.querySelectorAll('[data-cfg]').forEach(el => S.cfg[el.dataset.cfg] = el.value.trim()); LS.set('f_cfg', S.cfg); toast('保存しました'); render(); },
   aggPick: async () => { const fs = await pickFiles(); if (!fs.length) return; try { loadAggFiles(fs); } catch (e) { S.agg.err = e.message; } render(); },
-  aggBookFile: async () => { const f = await pickFile(); if (!f) return; S.agg.bookText = f.text; S.agg.book = parseBook(f.text); if (S.agg.book.size && S.session) saveBook(S.agg.book, f.name); S.agg.result = null; S.agg.showBook = false; toast(`帳簿 ${S.agg.book.size}品目`); render(); },
+  aggBookFile: async () => { const f = await pickFile(); if (!f) return; const map = parseBook(f.text);
+    if (map.flagOnly) return toast('これは配布用の在庫リスト(数なし)です。照合には「在庫リスト_管理者用_….csv」を選んでください', 6000);
+    S.agg.bookText = f.text; S.agg.book = map; if (map.size && S.session) saveBook(map, f.name); S.agg.result = null; S.agg.showBook = false; toast(`帳簿 ${map.size}品目`); render(); },
   aggBookPaste: () => { S.agg.showBook = !S.agg.showBook; render(); },
   aggBookApply: () => { S.agg.bookText = $('#aggBook').value; S.agg.book = parseBook(S.agg.bookText); if (S.agg.book.size && S.session) saveBook(S.agg.book, '貼り付け'); S.agg.result = null; S.agg.showBook = false; toast(`帳簿 ${S.agg.book.size}品目`); render(); },
   /* 帳簿在庫(棚卸の前に)の画面 */
@@ -11388,7 +11455,7 @@ const ACTIONS = {
   _bookSave: (text, name) => {
     const map = parseBook(text);
     if (!map.size) { S.bookUi.err = '品目コードが読み取れませんでした。GENのエクセル出力の B〜G 列(品目コード〜管理単位)を貼り付けているか、設定の ImportColumns を確認してください'; return render(); }
-    saveBook(map, name); S.agg.book = map; S.agg.result = null; S.bookUi = { text: '', show: false, err: '' };
+    saveBook(map, name); S.agg.book = map.flagOnly ? null : map; S.agg.result = null; S.bookUi = { text: '', show: false, err: '' };
     const ng = bookNotCountable(map).length;
     toast(`帳簿在庫 ${map.size}品目を保存しました(${S.session})` + (ng ? `。登録できない品目が ${ng}件あります` : ''), 5000); render();
   },
@@ -11397,7 +11464,17 @@ const ACTIONS = {
   aggExGen: () => { const o = S.agg.opt, R = S.agg.result; if (!R) return; if (!o.date) return toast('棚卸日を入れてください'); const d = o.date.replace(/-/g, '/');
     const rows = R.rows.filter(aggOut).sort((a, b) => a.code.localeCompare(b.code)).map(r => [d, r.code, o.loc || '0000000000000', '', r.qty]); if (!rows.length) return toast('出力できる品目がありません');
     downloadFile(genFile(`GEN取込_${fileSafe(S.session)}.csv`, csv(['棚卸日', '品目コード (品目)', 'ロケーションコード (ロケーション)', '製番(ロット品目の場合は「製番」列にロット番号を入力してください)', '棚卸数'], rows))); },
-  aggExNeed: () => { const R = S.agg.result; if (!R) return; const rows = R.rows.filter(r => !aggOut(r)); if (!rows.length) return toast('要対応はありません');
+  /* v3.2 集約CSV(集計シートの書式)と、紙の再カウント用の差異リスト */
+  aggExShu: async () => { const R = S.agg.result, o = S.agg.opt; if (!R) return; if (!o.date) return toast('棚卸日を入れてください');
+    const d = o.date.replace(/-/g, '/'), { rows, excluded } = shuRows(); if (!rows.length) return toast('出力できる品目がありません');
+    const text = csv(GEN_HEAD, rows.map(r => [d, r.code, o.loc || '0000000000000', '', r.qty])), base = `集約_${fileSafe(S.session)}_${stamp()}`;
+    await shareFilesOrDownload([genFile(base + '.csv', text), genFile(base + '_修正前.csv', text)]);
+    toast(`集約CSV(${rows.length}品目)と「_修正前」をダウンロードしました` + (excluded.length ? `。GENにない品目 ${excluded.length}件(${excluded.slice(0, 5).join('、')}${excluded.length > 5 ? '…' : ''})は入れていません` : ''), 7000); },
+  aggExNeed: () => { const R = S.agg.result; if (!R) return;
+    if (!FEATURE_RECOUNT) { const rows = R.rows.filter(r => ['差異あり', '未カウント', '帳簿なし'].includes(r.st)); if (!rows.length) return toast('差異のある品目はありません');
+      return blobDownload(`差異リスト_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '単位', '状態', '帳簿', '集計数', '差異', '担当者', '置き場', '再カウント数', 'メモ'], rows.map(r => [r.code, r.name, r.unit, r.st, r.book, r.qty, r.diff, r.who, r.loc, '', ''])));
+    }
+    const rows = R.rows.filter(r => !aggOut(r)); if (!rows.length) return toast('要対応はありません');
     blobDownload(`要対応_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '状態', '帳簿', '実在庫', '差異', '担当者', '置き場', '対応'], rows.map(r => [r.code, r.name, r.st, r.book, r.qty, r.diff, r.who, r.loc, needWhy(r) || '設定で出力']))); },
   aggExAll: () => { const R = S.agg.result; if (!R) return; blobDownload(`集計_${fileSafe(S.session)}.csv`, csv(['品目コード', '品目名', '単位', '帳簿', '初回', '実在庫', '差異', '状態', '修正の方法', '理由', '帳簿にある', '登録件数', '取消件数', '担当者', '置き場'], R.rows.map(r => [r.code, r.name, r.unit, r.book, r.first, r.qty, r.diff, r.st, r.method, r.reason, r.inBook, r.n, r.v, r.who, r.loc]))); },
   /* v3.0 差異の修正(管理者のPC) */
@@ -11431,8 +11508,9 @@ const ACTIONS = {
   resetMaster: () => { if (S.armed !== 'resetMaster') { S.armed = 'resetMaster'; return render(); } LS.del('f_master'); LS.del('f_master_at'); S.armed = null; toast('品目マスタを消しました。「マスタCSVを読み込む」で読み込み直してください', 4000); render(); },
 };
 document.addEventListener('click', async ev => {
-  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick],[data-rcpick],[data-ao]'); if (!el) return; const d = el.dataset;
+  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick],[data-rcpick],[data-ao],[data-tpick]'); if (!el) return; const d = el.dataset;
   if (d.pick) return pickItem(d.pick);
+  if (d.tpick) { S.code = d.tpick; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; go('scan'); setTimeout(() => $('#qtyIn')?.focus(), 50); return; }
   if (d.rcpick) { S.rcMode = true; LS.set('f_rc_mode', true); S.code = d.rcpick; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; go('scan'); if (lookup(d.rcpick)) setTimeout(() => $('#qtyIn')?.focus(), 50); return; }
   if (d.ao) { S.agg.open = S.agg.open === d.ao ? '' : d.ao; S.agg.adjForm = false; return render(); }
   if (d.go) return go(d.go);
@@ -11447,6 +11525,7 @@ document.addEventListener('input', ev => {
   if (id === 'qtyIn') { S.qty = v; const it = lookup(S.code.trim()); const p = it && (packs(it)[S.packIdx] || packs(it)[0]); const c = $('#conv'); if (c) c.textContent = it && num(v) != null && p.f !== 1 ? `= ${fmtN(rnd(num(v) * p.f))} ${it.Unit || ''}` : ''; }
   if (id === 'locIn') S.loc = v;
   if (id === 'mq') { S.master.q = v; S.master.limit = 150; render(); }
+  if (id === 'todoQ') { S.todoQ = v; render(); }
   if (id === 'impText') { S.imp.text = v; S.imp.preview = null; }
   if (id === 'bookText') S.bookUi.text = v;
   if (id === 'codeIn') {   // 入力しながら候補を出す(品目コードの完全一致は change で確定)
@@ -11459,7 +11538,7 @@ document.addEventListener('change', ev => {
     const v = t.value.trim();
     if (!v) { S.code = ''; S.codeQuery = ''; return render(); }
     if (master()[v]) return pickItem(v);                                // 品目コードと一致(QRリーダー・手入力)
-    const r = fuzzyFind(v, Object.values(master()).filter(x => x.CountTarget), 2);
+    const r = fuzzyFind(v, Object.values(master()).filter(isTarget), 2);
     if (r.length === 1) return pickItem(r[0].Title);                    // 候補が1件だけならそれを選ぶ
     if (!r.length && /^[\x21-\x7e]+$/.test(v)) return pickItem(v);      // 候補なし+コードらしい文字 → 「マスタ未登録」として表示(マスタを確認・登録へ)
     S.codeQuery = v;                                                    // 候補を表示したまま(再描画しない: 候補のタップを消さないため)
