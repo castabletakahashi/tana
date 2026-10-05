@@ -145,6 +145,7 @@ nav.tabs .badge{position:absolute;top:6px;right:calc(50% - 22px);background:var(
 <input type="file" id="photoIn" accept="image/*" capture="environment" hidden>
 <input type="file" id="fileIn" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden>
 <input type="file" id="filesIn" accept=".csv,text/csv" multiple hidden>
+<input type="file" id="rawIn" accept=".xlsx,.csv,.tsv,.txt" multiple hidden>
 <script>/* jsQR 1.4.0 (Apache-2.0) */
 (function webpackUniversalModuleDefinition(root, factory) {
 	if(typeof exports === 'object' && typeof module === 'object')
@@ -10260,7 +10261,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-3.3';
+const APP_VERSION = 'file-3.4';
 /* v3.2(2026-10-05)運用の決定: 再カウントは紙で行い、修正は管理者が「集約CSV」に直接行う。
    アプリの再修正モード・PCで数を直す機能は画面から隠す(仕組みは残す。true にすれば戻る) */
 const FEATURE_RECOUNT = false;
@@ -10395,6 +10396,58 @@ function genFile(name, text) {
 const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
 function pickFiles() { return new Promise(res => { const i = $('#filesIn'); i.value = ''; i.onchange = async () => { const out = []; for (const f of i.files) out.push({ name: f.name, text: await f.text() }); res(out); }; i.click(); }); }
+/* v3.4 管理者ツール用: ファイルをそのまま(バイト列で)読む。GEN のエクセル出力(.xlsx)と、Excel で保存した Shift-JIS の CSV に対応する */
+function pickRaw(multiple) { return new Promise(res => { const i = $('#rawIn'); i.multiple = !!multiple; i.value = ''; i.onchange = async () => { const out = []; for (const f of i.files) out.push({ name: f.name, at: f.lastModified || 0, bytes: new Uint8Array(await f.arrayBuffer()) }); res(out); }; i.click(); }); }
+function decodeText(u8) {   // UTF-8 として正しければ UTF-8、そうでなければ Shift-JIS(GEN の CSV・Excel で保存した CSV)
+  let t; try { t = new TextDecoder('utf-8', { fatal: true }).decode(u8); } catch (e) { t = new TextDecoder('shift_jis').decode(u8); }
+  return t.replace(/^﻿/, '');
+}
+/* .xlsx(ZIP の中の XML)の最初のシートを、行の配列(各行は文字の配列)にする。外部ライブラリは使わない(DecompressionStream を使う) */
+async function readXlsxRows(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), td = new TextDecoder();
+  let eocd = -1; for (let i = u8.length - 22; i >= Math.max(0, u8.length - 66000); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('Excel のファイル(.xlsx)として読めませんでした');
+  const files = {}; let p = dv.getUint32(eocd + 16, true);
+  for (let k = 0, n = dv.getUint16(eocd + 10, true); k < n && dv.getUint32(p, true) === 0x02014b50; k++) {
+    const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+    files[td.decode(u8.subarray(p + 46, p + 46 + nl))] = { method: dv.getUint16(p + 10, true), size: dv.getUint32(p + 20, true), off: dv.getUint32(p + 42, true) };
+    p += 46 + nl + xl + cl;
+  }
+  const get = async name => {
+    const f = files[name]; if (!f) return null;
+    const st = f.off + 30 + dv.getUint16(f.off + 26, true) + dv.getUint16(f.off + 28, true), data = u8.subarray(st, st + f.size);
+    if (f.method === 0) return td.decode(data);
+    if (typeof DecompressionStream === 'undefined') throw new Error('このブラウザでは Excel のファイルを読めません(Edge か Chrome の新しい版で開いてください)');
+    return td.decode(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+  };
+  const X = s => new DOMParser().parseFromString(s, 'application/xml');
+  let sheet = 'xl/worksheets/sheet1.xml';
+  const wb = await get('xl/workbook.xml'), rels = await get('xl/_rels/workbook.xml.rels');
+  if (wb && rels) {
+    const s = X(wb).getElementsByTagName('sheet')[0], rid = s && [...s.attributes].find(a => /(^|:)id$/.test(a.name) && a.name !== 'sheetId')?.value;
+    for (const r of X(rels).getElementsByTagName('Relationship')) if (r.getAttribute('Id') === rid) { const t = r.getAttribute('Target'); sheet = t.startsWith('/') ? t.slice(1) : 'xl/' + t.replace(/^\.\//, ''); }
+  }
+  const ss = [], sst = await get('xl/sharedStrings.xml');
+  if (sst) for (const si of X(sst).getElementsByTagName('si')) {   // ふりがな(rPh)は読まない
+    let s = ''; for (const ch of si.children) { if (ch.localName === 't') s += ch.textContent; else if (ch.localName === 'r') for (const t of ch.children) if (t.localName === 't') s += t.textContent; }
+    ss.push(s);
+  }
+  const xml = await get(sheet); if (!xml) throw new Error('Excel のシートが見つかりませんでした');
+  const colIx = ref => { let n = 0; for (const ch of String(ref).replace(/\d+/g, '')) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; };
+  const rows = [];
+  for (const row of X(xml).getElementsByTagName('row')) {
+    const ri = (parseInt(row.getAttribute('r'), 10) || rows.length + 1) - 1, out = [];
+    for (const c of row.children) {
+      if (c.localName !== 'c') continue;
+      const t = c.getAttribute('t'), v = [...c.children].find(x => x.localName === 'v')?.textContent ?? '';
+      out[colIx(c.getAttribute('r'))] = t === 's' ? (ss[+v] ?? '') : t === 'inlineStr' ? [...c.getElementsByTagName('t')].map(x => x.textContent).join('') : v;
+    }
+    rows[ri] = Array.from(out, x => x ?? '');
+  }
+  return Array.from(rows, r => r || []);
+}
+async function readTableFile(f) { return /\.xlsx$/i.test(f.name) ? readXlsxRows(f.bytes) : parseDelimited(decodeText(f.bytes)); }
+const findHeader = (rows, name) => rows.slice(0, 20).findIndex(r => r.some(x => String(x).trim() === name));
 function pickFile() { return new Promise(res => { const i = $('#fileIn'); i.value = ''; i.onchange = () => { const f = i.files[0]; if (!f) return res(null); const r = new FileReader(); r.onload = () => res({ name: f.name, text: r.result }); r.readAsText(f, 'utf-8'); }; i.click(); }); }
 
 /* ---------- 端末内データ ---------- */
@@ -10412,6 +10465,7 @@ const S = {
   imp: { text: '', all: false, newTarget: false, preview: null, err: '' },
   exportInfo: LS.get('f_export', null),   // {at, n, name}
   bookUi: { text: '', show: false, err: '' },
+  tools: { master: null, stock: null, shu: null, err: '' },   // v3.4 管理者ツールの結果
   agg: { files: [], rows: [], mchg: [], bookText: '', book: null, result: null, filter: 'すべて', err: '', open: '', adjForm: false,
          opt: { date: '', loc: '0000000000000', incDiff: false, zeroUncounted: false, enc: 'sjis', ...LS.get('f_agg_opt', {}) } },
   rcMode: LS.get('f_rc_mode', false),   // 再修正モード(再カウント担当の端末)
@@ -10530,18 +10584,37 @@ async function restoreFromCsv() {
 
 /* ---------- 品目マスタ:取込・GEN API・編集・CSV ---------- */
 function pick(obj, path) { if (!path) return obj; return String(path).split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj); }
-function previewImport() {
-  const [ci, ni, si, ui] = String(cfgVal('ImportColumns', '1,2,3,6,4')).split(',').map(s => parseInt(s, 10) - 1);
+/* v3.4: GEN の品目マスタ一覧の「エクセル出力」(.xlsx / .csv)を読む(旧「棚卸データ準備.bat -MasterFromFile」と同じ読み方)。
+   見出しの行(「品目コード」がある行)を探し、品目名・規格(「規格 *」>「規格」>「仕様」)・管理単位と、非表示の印を読む */
+function genMasterRecs(rows) {
+  const hi = findHeader(rows, '品目コード'); if (hi < 0) throw new Error('見出しの行(「品目コード」がある行)が見つかりません。GEN の品目マスタのエクセル出力か確認してください');
+  const h = rows[hi].map(x => String(x).trim()), data = rows.slice(hi + 1), ci = h.indexOf('品目コード'), ni = h.indexOf('品目名'), ui = h.indexOf('管理単位');
+  if (ni < 0) throw new Error('「品目名」の列が見つかりません。GEN の品目マスタのエクセル出力か確認してください');
+  if (h.includes('理論在庫数')) throw new Error('これは在庫リストのようです。「② 在庫リストを作る」で選んでください');
+  const si = ['規格 *', '規格', '仕様'].map(c => h.indexOf(c)).find(i => i >= 0 && data.some(r => String(r[i] ?? '').trim())) ?? -1;
+  const hid = h.findIndex(x => x.startsWith('非表示')), sti = h.indexOf('ステータス'), g = (r, i) => i >= 0 ? String(r[i] ?? '').trim() : '';
   const recs = new Map();
-  for (const r of parseDelimited(S.imp.text)) {
-    const code = String(r[ci] ?? '').trim(); if (!code || /品目コード|^コード$|^code$|^Title$/i.test(code)) continue;
-    recs.set(code, { code, name: String(r[ni] ?? '').trim(), spec: String(r[si] ?? '').trim(), unit: String(r[ui] ?? '').trim() });
+  for (const r of data) { const code = g(r, ci); if (code) recs.set(code, { code, name: g(r, ni), spec: g(r, si), unit: g(r, ui), hidden: g(r, hid) === '1' || g(r, sti).includes('非表示') }); }
+  if (!recs.size) throw new Error('品目が1件も読めませんでした');
+  recs.specCol = si >= 0 ? h[si] : '';
+  return recs;
+}
+function previewImport() {
+  let recs = S.imp.recsFile;   // v3.4: ファイルから読んだ時(貼り付けより優先)
+  if (!recs) {
+    const [ci, ni, si, ui] = String(cfgVal('ImportColumns', '1,2,3,6,4')).split(',').map(s => parseInt(s, 10) - 1);
+    recs = new Map();
+    for (const r of parseDelimited(S.imp.text)) {
+      const code = String(r[ci] ?? '').trim(); if (!code || /品目コード|^コード$|^code$|^Title$/i.test(code)) continue;
+      recs.set(code, { code, name: String(r[ni] ?? '').trim(), spec: String(r[si] ?? '').trim(), unit: String(r[ui] ?? '').trim() });
+    }
   }
   if (!recs.size) throw new Error('品目コードが読み取れませんでした。列の並びと設定(ImportColumns)を確認してください');
   const m = master(), pend = new Set(mlog().filter(l => l.GenStatus === '未反映').map(l => l.ItemCode));
-  const p = { add: [], chg: [], hold: [], same: 0, gone: [], recs };
+  const p = { add: [], chg: [], hold: [], same: 0, gone: [], hidden: 0, recs };
   for (const r of recs.values()) {
     const o = m[r.code];
+    if (r.hidden) { p.hidden++; if (o && o.InGen && o.Source !== 'APP') p.gone.push(o); continue; }   // GEN で非表示 → 新しくは入れない。今ある品目は「GENにない」の印(棚卸対象外)
     if (!o) p.add.push(r); else if (pend.has(r.code)) p.hold.push({ r, o });
     else if (o.ItemName !== r.name || o.Spec !== r.spec || o.Unit !== r.unit || !o.InGen) p.chg.push({ r, o }); else p.same++;
   }
@@ -10554,9 +10627,9 @@ function applyImport(p) {
   for (const o of p.gone) Object.assign(m[o.Title], { InGen: false, UpdatedBy: by, UpdatedAt: at });
   for (const r of p.add) m[r.code] = { Title: r.code, ItemName: r.name, Spec: r.spec, Unit: r.unit, Category: '', Packs: '', CountTarget: !!S.imp.newTarget, InGen: true, Source: 'GEN', UpdatedBy: by, UpdatedAt: at, GenSyncedAt: at };
   const hold = new Set(p.hold.map(x => x.o.Title));
-  for (const code of p.recs.keys()) if (m[code] && !hold.has(code)) m[code].GenSyncedAt = at;
+  for (const [code, r] of p.recs) if (m[code] && !hold.has(code) && !r.hidden) m[code].GenSyncedAt = at;
   saveMaster(m); LS.set('f_master_at', 'GEN取込 ' + fmtT(at));
-  const sum = `新規 ${p.add.length}件・変更 ${p.chg.length}件・保留 ${p.hold.length}件・変更なし ${p.same}件` + (S.imp.all ? `・GENにない ${p.gone.length}件` : '');
+  const sum = `新規 ${p.add.length}件・変更 ${p.chg.length}件・保留 ${p.hold.length}件・変更なし ${p.same}件` + (S.imp.all || p.gone.length ? `・GENにない/非表示 ${p.gone.length}件` : '');
   saveMlog(mlog().concat({ Title: uuid(), ItemCode: '(一括取込)', Action: 'GEN一括取込', Changes: sum, GenFields: false, GenStatus: '対象外', ActionBy: by, ActionByEmail: S.user.email || '', GenSyncedBy: '', ActionAt: at, GenSyncedAt: '' }));
   return sum;
 }
@@ -10642,8 +10715,8 @@ function parseCountCsv(file) {
   if (ix.Title < 0 || ix.ItemCode < 0 || ix.Qty < 0) throw new Error(`${file.name}: カウントCSVの形式ではありません(Title・ItemCode・Qty の列が必要)`);
   return rows.slice(1).map(r => { const o = { ファイル名: file.name }; COUNT_COLS.forEach(c => o[c] = ix[c] >= 0 ? String(r[ix[c]] ?? '').trim() : ''); o.Qty = num(o.Qty) || 0; o.InputQty = num(o.InputQty); o.Factor = num(o.Factor); return o; }).filter(o => o.Title);
 }
-function parseBook(text) {
-  const all = parseDelimited(text), m = new Map();
+function parseBook(text) {   // v3.4: 行の配列(.xlsx を読んだもの)も受け付ける
+  const all = Array.isArray(text) ? text : parseDelimited(text), m = new Map();
   // v3.2: 見出しの行(「品目コード」と「理論在庫…」がある行)があれば、列の名前で読む
   //       (管理者のツールが作る「在庫リスト_….csv」、GEN の在庫リストの CSV 出力、棚卸登録の見出しつき貼り付け)
   //       配布用(担当者向け)の在庫リストは数の列がなく「在庫あり」の列だけ → m.flagOnly = true(集計の照合には使えない)
@@ -10837,7 +10910,57 @@ function shuRows() {
   }
   return { rows, excluded };
 }
-const needWhy = r => !FEATURE_RECOUNT ? (r.st === '差異あり' ? '帳簿と差がある → 紙で再カウントし、集約CSVで直す' : r.st === '未カウント' ? '在庫があるのに登録がない(集約CSVでは 0)→ 確認して集約CSVで直す' : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : '')
+/* ---------- 管理者ツール(v3.4): 旧 .bat の代わり。PCのブラウザだけで動く(他のPCでセキュリティで .bat が使えないため) ---------- */
+/* ② GEN の在庫リストの「エクセル出力」から、配布用(数なし)と管理者用(理論在庫数つき)の在庫リストCSVを作る */
+function genStockList(rows) {
+  const hi = findHeader(rows, '品目コード'); if (hi < 0) throw new Error('見出しの行(「品目コード」がある行)が見つかりません。GEN の在庫リストのエクセル出力か確認してください');
+  const h = rows[hi].map(x => String(x).trim()), ci = h.indexOf('品目コード'), qi = h.indexOf('理論在庫数');
+  if (qi < 0) throw new Error('「理論在庫数」の列が見つかりません。GEN の在庫リストのエクセル出力か確認してください(品目マスタは「① 品目マスタを作る」で選びます)');
+  const ni = h.indexOf('品目名'), ui = h.indexOf('管理単位'), si = ['規格 *', '規格', '仕様'].map(c => h.indexOf(c)).find(i => i >= 0) ?? -1;
+  const g = (r, i) => i >= 0 ? String(r[i] ?? '').trim() : '', list = [];
+  for (const r of rows.slice(hi + 1)) { const code = g(r, ci); if (code) list.push({ code, name: g(r, ni), spec: g(r, si), unit: g(r, ui), qty: num(g(r, qi).replace(/,/g, '')) || 0 }); }
+  if (!list.length) throw new Error('在庫リストから品目が1件も読めませんでした');
+  return list;
+}
+/* ③ Excel で直した集約CSVを、GEN の棚卸登録に取り込める形に整える(旧「集約CSVをGEN用に整える.bat」と同じ確かめ方)。
+   Excel で開くと「0000000000000」が「0」になる・日付の形が変わる・数にカンマが入る、などを直す。直せないものはエラーで止める */
+function readShu(text, label) {
+  const rows = parseDelimited(text).filter(r => r.some(x => String(x).trim()));
+  if (!rows.length || !rows[0].some(x => String(x).includes('品目コード'))) throw new Error(`${label}: 集約CSVの形式ではありません(1行目に「品目コード」の見出しが必要)`);
+  return rows.slice(1).map((r, i) => ({ line: i + 2, d: String(r[0] ?? '').trim(), code: String(r[1] ?? '').trim(), loc: String(r[2] ?? '').trim(), lot: String(r[3] ?? '').trim(), qty: String(r[4] ?? '').trim() }));
+}
+function normShuDate(s) {
+  s = String(s).normalize('NFKC').trim();
+  let m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(\s.*)?$/) || s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (!m && /^\d{5}(\.\d+)?$/.test(s) && +s > 30000 && +s < 80000) { const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(+s) * 864e5); m = [0, d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()]; }   // Excel の日付の数値
+  if (!m || +m[2] < 1 || +m[2] > 12 || +m[3] < 1 || +m[3] > 31) return null;
+  return `${m[1]}/${String(+m[2]).padStart(2, '0')}/${String(+m[3]).padStart(2, '0')}`;
+}
+function fixShu(mainText, beforeText, opt) {
+  const errs = [], warns = [], out = [], seen = new Map(), defLoc = opt.loc || '0000000000000';
+  for (const r of readShu(mainText, opt.name)) {
+    if (!r.code) continue;
+    const d = normShuDate(r.d); if (!d) errs.push(`${r.line}行目 ${r.code}: 棚卸日「${r.d}」が日付として読めません`);
+    let loc = r.loc; if (!loc || loc === '0') loc = defLoc; else if (/^\d+$/.test(loc) && loc.length < 13) loc = loc.padStart(13, '0');
+    const qs = r.qty.normalize('NFKC').replace(/,/g, ''); let q = 0;
+    if (qs === '') warns.push(`${r.line}行目 ${r.code}: 棚卸数が空 → 0 にしました`);
+    else if (!/^-?\d+(\.\d+)?$/.test(qs)) errs.push(`${r.line}行目 ${r.code}: 棚卸数「${r.qty}」が数ではありません`);
+    else q = +qs;
+    if (q < 0) warns.push(`${r.line}行目 ${r.code}: 棚卸数がマイナス(${q})`);
+    if (seen.has(r.code)) errs.push(`${r.line}行目 ${r.code}: 品目コードが重複しています(${seen.get(r.code)}行目と)`); else seen.set(r.code, r.line);
+    out.push({ d: d || r.d, code: r.code, loc, lot: r.lot, qty: q });
+  }
+  if (!out.length && !errs.length) errs.push('品目の行が1つもありません');
+  let chg = null;
+  if (beforeText != null) {
+    const before = new Map(); for (const r of readShu(beforeText, '_修正前')) if (r.code) before.set(r.code, num(r.qty.replace(/,/g, '')) || 0);
+    chg = [];
+    for (const o of out) { if (!before.has(o.code)) chg.push([o.code, '', o.qty, '', '行を追加']); else if (before.get(o.code) !== o.qty) chg.push([o.code, before.get(o.code), o.qty, rnd(o.qty - before.get(o.code)), '数を修正']); }
+    for (const [c, v] of before) if (!seen.has(c)) chg.push([c, v, '', '', '行を削除']);
+  }
+  return { errs, warns, out, chg };
+}
+const needWhy =r => !FEATURE_RECOUNT ? (r.st === '差異あり' ? '帳簿と差がある → 紙で再カウントし、集約CSVで直す' : r.st === '未カウント' ? '在庫があるのに登録がない(集約CSVでは 0)→ 確認して集約CSVで直す' : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : '')
   : r.st === '再修正中' ? `再修正の数が届くのを待っています(第${r.req}回)`
   : r.st === '修正済・差異あり' && !r.reason ? '修正後も帳簿と差があります。理由を入れると GEN取込に出ます(「数を直す・確定」)'
   : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : r.st === '未カウント' ? '数えていない。再修正に入れるか、在庫0なら設定で0出力'
@@ -10885,7 +11008,7 @@ function notices() {
 }
 function tabs() {
   const t = [['scan', '読取', ICON.scan], ['history', '履歴', ICON.hist], ['export', '書き出し', ICON.out, unexported().length], ...(rcReq() ? [['recount', '再修正', ICON.rc, rcLeft()]] : []), ['master', 'マスタ', ICON.mst], ['setting', '設定', ICON.set]];
-  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting', todo: 'scan' }[S.screen] || S.screen;
+  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting', tools: 'setting', todo: 'scan' }[S.screen] || S.screen;
   return `<nav class="tabs" aria-label="画面"><div class="in">${t.map(([k, l, ic, b]) => `<button data-go="${k}" ${cur === k ? 'aria-current="page"' : ''}>${ic}${b ? `<span class="badge">${b}</span>` : ''}<span>${l}</span></button>`).join('')}</div></nav>`;
 }
 function scrScan() {
@@ -11081,18 +11204,21 @@ function scrMasterEdit() {
 function scrMasterImport() {
   const I = S.imp, p = I.preview;
   return bar('GENから品目マスタを更新') + `<main>
-    <button class="btn sm" data-go="master">← 品目マスタへ</button>
-    <div class="note"><b>ふだんは、管理者のPCの「棚卸データ準備.bat」を使います。</b>GEN の API から取得して <code>品目マスタ_….csv</code> を作るので、それを マスタ →「マスタCSVを読み込む」で読み込むだけです。<br>この画面は、GENのエクセル出力(棚卸登録の B〜G列など)を貼り付けて更新したい時に使います(列の位置: ${esc(cfgVal('ImportColumns', '1,2,3,6,4'))})。</div>
+    ${I.recsFile ? '<button class="btn sm" data-go="tools">← 管理者ツールへ</button>' : '<button class="btn sm" data-go="master">← 品目マスタへ</button>'}
+    ${I.recsFile ? `<div class="panel"><b>ファイル: ${esc(I.fileName)}</b>(${I.recsFile.size}品目・うち GEN で非表示 ${p ? p.hidden : 0}・規格の列: ${esc(I.recsFile.specCol || 'なし')})
+      <p class="muted small">品目名・規格・管理単位を GEN の内容にそろえます。GEN で非表示の品目は「GENにない」の印を付けます(棚卸対象外)。ファイルにない品目はそのままです。「反映する」を押すと、配る用の <code>品目マスタ_….csv</code> もダウンロードします。</p>
+      <button class="btn sm" data-act="impFileClear">ファイルをやめて貼り付けにする</button></div>`
+    : `<div class="note"><b>ふだんは 設定 →「管理者ツール」→「① 品目マスタを作る」で、GEN の品目マスタのエクセル出力を選びます。</b><br>この画面では、GENのエクセル出力(棚卸登録の B〜G列など)を貼り付けて更新することもできます(列の位置: ${esc(cfgVal('ImportColumns', '1,2,3,6,4'))})。</div>
     <textarea id="impText" placeholder="ここに貼り付け" aria-label="貼り付け">${esc(I.text)}</textarea>
     <label class="toggle"><input type="checkbox" id="impAll" ${I.all ? 'checked' : ''}> 全品目(貼り付けにない品目に「GENにない」の印を付ける)</label>
+    <button class="btn block" data-act="impPreview" style="margin-top:8px">内容を確認</button>`}
     ${I.err ? `<div class="err">${esc(I.err)}</div>` : ''}
-    <button class="btn block" data-act="impPreview" style="margin-top:8px">内容を確認</button>
     ${p ? `<h2>確認結果</h2>
-      <div class="chips" style="flex-wrap:wrap"><span class="chip">新規<span class="k">${p.add.length}</span></span><span class="chip">変更<span class="k">${p.chg.length}</span></span><span class="chip">保留<span class="k">${p.hold.length}</span></span><span class="chip">変更なし<span class="k">${p.same}</span></span>${I.all ? `<span class="chip">GENにない<span class="k">${p.gone.length}</span></span>` : ''}</div>
+      <div class="chips" style="flex-wrap:wrap"><span class="chip">新規<span class="k">${p.add.length}</span></span><span class="chip">変更<span class="k">${p.chg.length}</span></span><span class="chip">保留<span class="k">${p.hold.length}</span></span><span class="chip">変更なし<span class="k">${p.same}</span></span>${I.all || p.gone.length ? `<span class="chip">GENにない・非表示<span class="k">${p.gone.length}</span></span>` : ''}</div>
       ${p.chg.length ? `<h2>変更</h2><table class="diff">${p.chg.slice(0, 300).map(({ r, o }) => `<tr><td>${esc(r.code)}</td><td>${['name:ItemName', 'spec:Spec', 'unit:Unit'].map(k => { const [a, b] = k.split(':'); return o[b] !== r[a] ? `<span class="old-v">${esc(o[b] || '(空)')}</span> → ${esc(r[a] || '(空)')}` : `<span class="muted">${esc(r[a])}</span>`; }).join('<br>')}</td></tr>`).join('')}</table>` : ''}
       ${p.add.length ? `<h2>新規</h2><table class="diff">${p.add.slice(0, 300).map(r => `<tr><td>${esc(r.code)}</td><td>${esc(r.name)}<br><span class="muted">${esc(r.spec)} ${esc(r.unit)}</span></td></tr>`).join('')}</table>` : ''}
       ${p.hold.length ? `<h2>保留(GEN反映待ちのため上書きしない)</h2><table class="diff">${p.hold.map(({ r }) => `<tr><td>${esc(r.code)}</td><td>${esc(r.name)}</td></tr>`).join('')}</table>` : ''}
-      ${p.gone.length ? `<h2>GENにない</h2><table class="diff">${p.gone.slice(0, 300).map(o => `<tr><td>${esc(o.Title)}</td><td>${esc(o.ItemName)}</td></tr>`).join('')}</table>` : ''}
+      ${p.gone.length ? `<h2>GENにない・非表示(棚卸対象外にする)</h2><table class="diff">${p.gone.slice(0, 300).map(o => `<tr><td>${esc(o.Title)}</td><td>${esc(o.ItemName)}</td></tr>`).join('')}</table>` : ''}
       <button class="btn primary big block" data-act="impApply" style="margin-top:12px">反映する</button>` : ''}
   </main>`;
 }
@@ -11137,7 +11263,8 @@ function scrAgg() {
       ${FEATURE_RECOUNT ? `<div class="stack"><button class="btn primary block" data-act="aggExGen">GEN取込CSVをダウンロード(${R.rows.filter(aggOut).length}品目)</button>
       <div class="row"><button class="btn" data-act="aggExNeed">要対応CSV(${cnt('要対応')})</button><button class="btn" data-act="aggExAll">集計CSV(全品目)</button></div></div>`
       : `<div class="stack"><button class="btn primary big block" data-act="aggExShu">集約CSVをダウンロード(${shuRows().rows.length}品目)</button>
-      <p class="muted small" style="margin:0">集計シートと同じ書式(棚卸日・品目コード・ロケーションコード・製番・棚卸数)。<b>棚卸対象の全品目</b>を品目コード順に並べ、数えていない品目は 0。同じ内容の「…_修正前.csv」も一緒に保存されます(直した品目の記録に使うので、こちらは直さない)。差異は紙で再カウントし、<b>集約CSVを Excel で直接直して</b>から「集約CSVをGEN用に整える.bat」に通して GEN に取り込みます。</p>
+      <p class="muted small" style="margin:0">集計シートと同じ書式(棚卸日・品目コード・ロケーションコード・製番・棚卸数)。<b>棚卸対象の全品目</b>を品目コード順に並べ、数えていない品目は 0。同じ内容の「…_修正前.csv」も一緒に保存されます(直した品目の記録に使うので、こちらは直さない)。差異は紙で再カウントし、<b>集約CSVを Excel で直接直して</b>から、設定 →「管理者ツール」→「③ 集約CSVを GEN 用に整える」に通して GEN に取り込みます。</p>
+      <button class="btn block" data-go="tools">管理者ツールを開く(③ 集約CSVを整える)</button>
       <div class="row"><button class="btn" data-act="aggExNeed">差異リスト(紙の再カウント用・${R.rows.filter(r => ['差異あり', '未カウント', '帳簿なし'].includes(r.st)).length})</button><button class="btn" data-act="aggExAll">集計CSV(全品目・詳しい)</button></div></div>`}
       ${FEATURE_RECOUNT ? `<h2>4. 差異の修正</h2>
       <div class="panel stack">
@@ -11199,6 +11326,42 @@ function scrBook() {
       <button class="btn danger block ${S.armed === 'clearBook' ? 'armed' : ''}" data-act="clearBook" style="margin-top:12px">${S.armed === 'clearBook' ? 'もう一度押すと消します' : 'この棚卸回の帳簿在庫を消す'}</button>` : ''}
   </main>`;
 }
+/* 管理者ツール(v3.4): 旧 .bat の3つの仕事を、PCのブラウザだけでする */
+function scrTools() {
+  const T = S.tools, M = T.master, K = T.stock, Z = T.shu, sb = savedBook();
+  const msgs = (list, cls) => list.length ? `<div class="${cls}">${list.slice(0, 30).map(esc).join('<br>')}${list.length > 30 ? `<br>…ほか ${list.length - 30}件` : ''}</div>` : '';
+  return bar('管理者ツール(PC向け)') + `<main>
+    <button class="btn sm" data-go="setting">← 設定へ</button>
+    <p class="muted small">GEN から出したファイルを選ぶだけで、配るファイル・GEN に取り込むファイルを作ります。<b>.bat は使いません</b>(PCのブラウザだけで動きます)。できたファイルは「ダウンロード」フォルダに入ります。</p>
+    ${T.err ? `<div class="err">${esc(T.err)}</div>` : ''}
+    <h2>① 品目マスタを作る(棚卸の前)</h2>
+    <div class="panel">
+      <p class="small" style="margin-top:0">GEN → 品目マスタ →「<b>エクセル出力</b>」でできた <code>品目マスタ….xlsx</code> を選びます(CSV出力の .csv でも可)。内容を確認して「反映する」を押すと、配る用の <code>品目マスタ_日付.csv</code> がダウンロードされます。</p>
+      <button class="btn primary block" data-act="toolMaster">GEN の品目マスタのファイルを選ぶ</button>
+      ${M ? `<p class="small" style="color:var(--good)">${esc(M)}</p>` : ''}
+      <p class="muted small">このPCの品目マスタ: ${masterCount()}品目(${esc(LS.get('f_master_at', '未読込'))})・棚卸対象 ${Object.values(master()).filter(isTarget).length}品目(${esc(targetPrefixes().join('・'))})</p>
+    </div>
+    <h2>② 在庫リストを作る(棚卸の前)</h2>
+    <div class="panel">
+      <p class="small" style="margin-top:0">GEN → 在庫リスト →「<b>エクセル出力</b>」でできた <code>在庫リスト….xlsx</code> を選びます。2つのファイルがダウンロードされます。</p>
+      <table class="diff"><tr><td><code>在庫リスト_配布用_日付.csv</code></td><td><b>配る</b>(在庫がある品目の一覧。数は入っていない)</td></tr><tr><td><code>在庫リスト_管理者用_日付.csv</code></td><td><b>配らない</b>(理論在庫数つき。集計の照合に使う)</td></tr></table>
+      <button class="btn primary block" data-act="toolStock" style="margin-top:8px" ${S.session ? '' : 'disabled'}>GEN の在庫リストのファイルを選ぶ</button>
+      ${S.session ? '' : '<p class="small" style="color:var(--bad)">先に設定で棚卸回を入れてください(在庫リストは棚卸回ごとに保存します)</p>'}
+      ${K ? `<p class="small" style="color:var(--good)">${esc(K)}</p>` : ''}
+      <p class="muted small">このPCの在庫リスト(${esc(S.session || '棚卸回 未設定')}): ${sb ? `${sb.n}品目・${esc(sb.name)}${sb.flagOnly ? '(配布用・数なし)' : ''}` : 'なし'}。ここで作ると、このPCの集計にも自動で入ります。</p>
+    </div>
+    <h2>③ 集約CSVを GEN 用に整える(最後)</h2>
+    <div class="panel">
+      <p class="small" style="margin-top:0">集計でダウンロードし、Excel で直して保存した <code>集約_….csv</code> と、一緒にできた <code>集約_…_修正前.csv</code> を<b>2つまとめて選びます</b>(Ctrl を押しながらクリック)。Excel で「0」になったロケーションコードや、日付・数の形を直して、GEN に取り込む <code>GEN取込_….csv</code> と、直した品目の記録 <code>修正記録_….csv</code> を作ります。</p>
+      <div class="field"><label for="toolLoc">ロケーションコードが空・「0」の時に入れる13桁</label><input type="text" id="toolLoc" value="${esc(S.agg.opt.loc || '0000000000000')}" inputmode="numeric" autocomplete="off"></div>
+      <button class="btn primary block" data-act="toolShu" style="margin-top:8px">集約CSV(と _修正前)を選ぶ</button>
+      ${Z ? `${Z.errs.length ? `<div class="err"><b>直してほしいところがあります(GEN取込CSVは作っていません)。</b>集約CSVを Excel で直して保存し、もう一度選んでください。</div>${msgs(Z.errs, 'err')}`
+        : `<p class="small" style="color:var(--good)">${esc(Z.msg)}</p><div class="note">次は GEN → 棚卸登録 → インポートで「<b>${esc(Z.gen)}</b>」を取り込みます。${Z.rec ? `「${esc(Z.rec)}」は Teams の「棚卸」に保存します。` : ''}</div>`}
+        ${msgs(Z.warns, 'note')}` : ''}
+      <p class="muted small">文字コード: ${(S.agg.opt.enc || 'sjis') === 'utf8' ? 'UTF-8' : 'Shift-JIS'}(集計画面の設定と同じ)</p>
+    </div>
+  </main>`;
+}
 function scrSetting() {
   const c = S.cfg;
   const fld = (id, label, key, ph = '') => `<div class="field"><label for="${id}">${label}</label><input type="text" id="${id}" data-cfg="${key}" value="${esc(c[key] ?? '')}" placeholder="${esc(ph)}" autocomplete="off" autocapitalize="off" spellcheck="false"></div>`;
@@ -11216,6 +11379,7 @@ function scrSetting() {
     </div>` : ''}
     <h2>管理者・PC向け</h2>
     <div class="stack">
+      <button class="btn primary block" data-go="tools">管理者ツール(品目マスタ・在庫リストを作る/集約CSVを整える)</button>
       <button class="btn block" data-go="book">帳簿在庫を読み込む(棚卸の前に)${savedBook() ? `<span class="muted small">(${esc(S.session)}: ${savedBook().n}品目 読み込み済み)</span>` : ''}</button>
       <button class="btn block" data-go="agg">全員のCSVを集計してGEN取込CSVを作る</button>
     </div>
@@ -11234,8 +11398,8 @@ function scrSetting() {
     </div>
     <h2>品目マスタの更新(GEN)</h2>
     <div class="panel">
-      <p class="small" style="margin-top:0">品目マスタと在庫リストは、<b>管理者のPCの「棚卸データ準備.bat」</b>で作り(品目マスタは GEN の API、在庫リストは GEN のエクセル出力から)、サイボウズで配ります。各端末は マスタ →「<b>マスタCSVを読み込む</b>」「<b>在庫リストを読み込む</b>」で最新になります。</p>
-      <p class="muted small">GEN の API はブラウザ(このアプリ)から直接は呼べないため、端末に APIトークンは入れません。</p>
+      <p class="small" style="margin-top:0">品目マスタと在庫リストは、管理者が上の「<b>管理者ツール</b>」で GEN のエクセル出力から作り、サイボウズで配ります。各端末は マスタ →「<b>マスタCSVを読み込む</b>」「<b>在庫リストを読み込む</b>」で最新になります。</p>
+      <p class="muted small">GEN の API はブラウザ(このアプリ)から直接は呼べないため、端末に APIトークンは入れません(.bat が使えるPCでは「棚卸データ準備.bat」で API から作ることもできます)。</p>
       ${fld('cImp', '貼り付けで取り込む時の列位置(品目コード,品目名,規格,管理単位,理論在庫)', 'ImportColumns')}
       <button class="btn block" data-act="saveCfg" style="margin-top:10px">列位置を保存</button>
     </div>
@@ -11249,7 +11413,7 @@ function scrSetting() {
     </div>
   </main>`;
 }
-const SCREENS = { scan: scrScan, todo: scrTodo, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, setting: scrSetting };
+const SCREENS = { scan: scrScan, todo: scrTodo, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, tools: scrTools, setting: scrSetting };
 function render() {
   const y = window.scrollY, act = document.activeElement?.id;
   $('#app').innerHTML = (SCREENS[S.screen] || scrScan)() + tabs();
@@ -11257,6 +11421,7 @@ function render() {
   window.scrollTo(0, y);
 }
 function go(screen) {
+  if (screen === 'tools' && S.screen === 'setting') S.tools = { master: null, stock: null, shu: null, err: '' };   // 設定から開き直した時は前の結果を消す
   S.armed = null; S.screen = screen;
   if (screen === 'agg' && !S.agg.book) { const sb = savedBook(); if (sb && !sb.flagOnly) S.agg.book = sb.map; }   // 棚卸の前に読み込んだ帳簿在庫を使う(配布用=数なしは照合に使えない)
   if (screen === 'book') S.bookUi.err = '';
@@ -11431,8 +11596,46 @@ const ACTIONS = {
   aggMergeMaster: () => { const n = mergeMasterChanges(); toast(`品目マスタに ${n}件を取り込みました。全員に配るには マスタ →「マスタCSVを書き出す」`, 6000); render(); },
   markSynced: () => { if (S.armed !== 'synced') { S.armed = 'synced'; return render(); } const at = nowIso(); let n = 0;
     saveMlog(mlog().map(l => l.GenStatus === '未反映' ? (n++, { ...l, GenStatus: '反映済', GenSyncedBy: S.user.name, GenSyncedAt: at }) : l)); S.armed = null; toast(`${n}件を反映済にしました`); render(); },
-  impPreview: () => { S.imp.err = ''; S.imp.text = $('#impText').value; try { S.imp.preview = previewImport(); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } render(); },
-  impApply: () => { const p = S.imp.preview; if (!p) return; const s = applyImport(p); S.imp.preview = null; S.imp.text = ''; toast('反映しました: ' + s + '。他の端末に配るには「マスタCSVを書き出す」', 6000); go('master'); },
+  impPreview: () => { S.imp.err = ''; if ($('#impText')) S.imp.text = $('#impText').value; try { S.imp.preview = previewImport(); } catch (e) { S.imp.err = e.message; S.imp.preview = null; } render(); },
+  impApply: async () => { const p = S.imp.preview; if (!p) return; const fromFile = !!S.imp.recsFile; const s = applyImport(p); S.imp.preview = null; S.imp.text = ''; S.imp.recsFile = null;
+    if (!fromFile) { toast('反映しました: ' + s + '。他の端末に配るには「マスタCSVを書き出す」', 6000); return go('master'); }
+    await exportMaster(); S.tools.master = `反映しました(${s})。配る用の「品目マスタ_….csv」(${masterCount()}品目)をダウンロードしました。`; go('tools'); },
+  impFileClear: () => { S.imp.recsFile = null; S.imp.preview = null; S.imp.err = ''; render(); },
+  /* v3.4 管理者ツール */
+  toolMaster: async () => { const [f] = await pickRaw(false); if (!f) return; S.tools.err = ''; busy('読み込み中…');
+    try { const recs = genMasterRecs(await readTableFile(f)); Object.assign(S.imp, { recsFile: recs, fileName: f.name, all: false, err: '', text: '' }); S.imp.preview = previewImport(); unbusy(); go('masterImport'); }
+    catch (e) { unbusy(); S.tools.err = `${f.name}: ${e.message}`; render(); } },
+  toolStock: async () => { if (!S.session) return toast('先に設定で棚卸回を入れてください'); const [f] = await pickRaw(false); if (!f) return; S.tools.err = ''; busy('読み込み中…');
+    try {
+      const list = genStockList(await readTableFile(f)), withStock = list.filter(b => b.qty !== 0), st = stamp(), H = ['品目コード', '品目名', '規格', '管理単位'];
+      await shareFilesOrDownload([{ name: `在庫リスト_配布用_${st}.csv`, text: csv([...H, '在庫あり'], withStock.map(b => [b.code, b.name, b.spec, b.unit, 1])) },
+        { name: `在庫リスト_管理者用_${st}.csv`, text: csv([...H, '理論在庫数'], list.map(b => [b.code, b.name, b.spec, b.unit, b.qty])) }]);
+      const map = new Map(list.map(b => [b.code, b])); saveBook(map, `在庫リスト_管理者用_${st}.csv`); S.agg.book = map; S.agg.result = null;
+      const ng = bookNotCountable(map).length;
+      S.tools.stock = `${f.name} から ${list.length}品目(在庫が0以外 ${withStock.length}品目)。「在庫リスト_配布用_${st}.csv」と「在庫リスト_管理者用_${st}.csv」をダウンロードし、このPCの集計用にも保存しました(${S.session})。` + (ng ? `棚卸対象のコードなのに品目マスタにない・非表示の品目が ${ng}件あります(設定 → 帳簿在庫 で確認)。` : '');
+    } catch (e) { S.tools.err = `${f.name}: ${e.message}`; }
+    unbusy(); render(); },
+  toolShu: async () => { const loc = String($('#toolLoc')?.value || '').trim(); if (loc && !/^\d{13}$/.test(loc)) return toast('ロケーションコードは13桁の数字で入れてください'); if (loc) { S.agg.opt.loc = loc; LS.set('f_agg_opt', S.agg.opt); }
+    const fs = await pickRaw(true); if (!fs.length) return; S.tools.err = ''; S.tools.shu = null;
+    const bare = n => n.replace(/\.csv$/i, '').replace(/ \(\d+\)$/, '');
+    const mains = fs.filter(f => /\.csv$/i.test(f.name) && !/_修正前( \(\d+\))?\.csv$/i.test(f.name)).sort((a, b) => b.at - a.at), befores = fs.filter(f => /_修正前( \(\d+\))?\.csv$/i.test(f.name));
+    if (!mains.length) { S.tools.err = befores.length ? '「_修正前」のファイルだけが選ばれています。Excel で直した方の 集約_….csv も一緒に選んでください' : '集約_….csv(CSV)を選んでください'; return render(); }
+    const main = mains[0], before = befores.find(f => bare(f.name).replace(/_修正前$/, '') === bare(main.name)) || (befores.length === 1 ? befores[0] : null);
+    try {
+      const r = fixShu(decodeText(main.bytes), before ? decodeText(before.bytes) : null, { loc: S.agg.opt.loc, name: main.name });
+      if (mains.length > 1) r.warns.unshift(`集約CSVが ${mains.length}つ選ばれたので、いちばん新しい「${main.name}」を使いました`);
+      if (!before) r.warns.push('「…_修正前.csv」が選ばれていないので、修正記録は作っていません(集約CSVと一緒にダウンロードされたファイル)');
+      if (!r.errs.length) {
+        const m = bare(main.name).match(/^集約_(.+?)_\d{8}-\d{4}/), ses = m ? m[1] : fileSafe(S.session || '棚卸'), st = stamp();
+        const gen = `GEN取込_${ses}_${st}.csv`, files = [genFile(gen, csv(GEN_HEAD, r.out.map(o => [o.d, o.code, o.loc, o.lot, o.qty])))];
+        let rec = '';
+        if (r.chg) { rec = `修正記録_${ses}_${st}.csv`; files.push({ name: rec, text: csv(['品目コード', '修正前', '修正後', '差', '内容'], r.chg) }); }
+        await shareFilesOrDownload(files);
+        Object.assign(r, { gen, rec, msg: `「${main.name}」を整えました: ${r.out.length}品目・棚卸日 ${[...new Set(r.out.map(o => o.d))].join('、')}・ロケーション ${[...new Set(r.out.map(o => o.loc))].join('、')}` + (r.chg ? `・直した品目 ${r.chg.length}` : '') + '。' });
+      }
+      S.tools.shu = r;
+    } catch (e) { S.tools.err = e.message; }
+    render(); },
   saveBasic: () => { const ses = normSession($('#sesIn').value); if (!ses) return toast('棚卸回は「年-月」で入れてください(例 2026-11)', 4000); S.session = ses; S.user = { name: $('#nameIn').value.trim(), email: $('#mailIn').value.trim() }; LS.set('f_session', S.session); LS.set('f_user', S.user); S.exportInfo = null; LS.del('f_export'); S.agg.book = null; S.agg.result = null; toast('保存しました'); render(); },
   saveTarget: () => {
     const sel = [...document.querySelectorAll('.tpx')].filter(x => x.checked).map(x => x.value);
