@@ -10264,7 +10264,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-3.9';
+const APP_VERSION = 'file-3.9.1';
 /* v3.2(2026-10-05)運用の決定: 再カウントは紙で行い、修正は管理者が「集約CSV」に直接行う。
    アプリの再修正モード・PCで数を直す機能は画面から隠す(仕組みは残す。true にすれば戻る) */
 const FEATURE_RECOUNT = false;
@@ -10811,7 +10811,8 @@ function runAgg() {
       qty = a.qty; reason = a.reason; fixedBy = a.by; fixedAt = a.at;
     }
     const diff = rnd(qty - bookQty), fixed = !!a || maxR > 1, pending = !!rq && rq.round > maxR && !a;
-    const st = pending ? '再修正中' : !b ? '帳簿なし' : (!list.length && !a) ? '未カウント'
+    // v3.9.1: 品目マスタにあるが棚卸対象外の品目(頭文字が対象外・GEN で非表示)を「マスタ外」などで記録した時は「対象外」。GEN取込には入れない
+    const st = (it && !isTarget(it)) ? '対象外' : pending ? '再修正中' : !b ? '帳簿なし' : (!list.length && !a) ? '未カウント'
       : fixed ? (diff === 0 ? '修正済' : '修正済・差異あり') : (diff === 0 ? '差異なし' : '差異あり');
     out.push({ code, name: b?.name || it?.ItemName || list[0]?.ItemName || '', unit: b?.unit || it?.Unit || '', book: bookQty, qty, first: sum(first), diff, st, inBook: !!b,
       n: latest.length, v: voids.get(code) || 0, who: uniq(list, r => r.Counter), loc: uniq(latest, r => r.Location), loc1: uniq(first, r => r.Location),
@@ -10917,7 +10918,7 @@ function shuRows() {
   const rows = [], excluded = [];
   for (const code of [...codes].sort()) {
     const r = by.get(code), it = m[code];
-    if (!((r && r.inBook) || (it && it.InGen))) { excluded.push(code); continue; }
+    if (!((r && r.inBook) || (it && it.InGen)) || (it && !isTarget(it))) { excluded.push(code); continue; }   // GEN にない・棚卸対象外は入れない
     rows.push({ code, qty: r ? r.qty : 0 });
   }
   return { rows, excluded };
@@ -11034,7 +11035,7 @@ async function prepSet(files, ses) {
 }
 /* ---------- 数え直し(v3.6): 紙に書いた数をアプリに入れる ----------
    対象 = 集計で「差異あり・未カウント・帳簿なし」になった品目と、数え直しの数を入れた品目。紙(差異リスト)と同じ品目コード順 */
-const DIFF_ST = ['差異あり', '未カウント', '帳簿なし', '修正済', '修正済・差異あり'];
+const DIFF_ST = ['差異あり', '未カウント', '帳簿なし', '対象外', '修正済', '修正済・差異あり'];
 const diffRows = () => { const R = S.agg.result; return R ? R.rows.filter(r => DIFF_ST.includes(r.st)).sort((a, b) => a.code.localeCompare(b.code)) : []; };
 const firstQty = r => { const a = adjOf()[r.code]; return a && a.base != null ? a.base : r.qty; };   // 数え直す前(集計)の数
 const stLabel = st => st === '修正済' ? '数え直し済' : st === '修正済・差異あり' ? '数え直し済(差あり)' : st;
@@ -11080,7 +11081,7 @@ async function exportGenFinal() {
   S.agg.done = { gen: files[0].name, rec: rec.length ? files[1].name : '', n: rows.length, nRec: rec.length, excluded: excluded.length };
   render();
 }
-const needWhy = r => !FEATURE_RECOUNT ? (r.st === '差異あり' ? '帳簿と差がある → 差異リストで数え直し、「4 数え直した数を入れる」で入れる' : r.st === '未カウント' ? '在庫があるのに登録がない(このままなら 0)→ 数え直して「4」で入れる' : r.st === '帳簿なし' ? 'GEN の帳簿にないコード(マスタ外の記録など)。GEN取込には入らない。QR・コードを確認' : '')
+const needWhy = r => !FEATURE_RECOUNT ? (r.st === '差異あり' ? '帳簿と差がある → 差異リストで数え直し、「4 数え直した数を入れる」で入れる' : r.st === '未カウント' ? '在庫があるのに登録がない(このままなら 0)→ 数え直して「4」で入れる' : r.st === '帳簿なし' ? 'GEN の帳簿にないコード(マスタ外の記録など)。GEN取込には入らない。QR・コードを確認' : r.st === '対象外' ? '棚卸対象外の品目の記録(原料・GEN で非表示など)。GEN取込には入らない。コードを確認' : '')
   : r.st === '再修正中' ? `再修正の数が届くのを待っています(第${r.req}回)`
   : r.st === '修正済・差異あり' && !r.reason ? '修正後も帳簿と差があります。理由を入れると GEN取込に出ます(「数を直す・確定」)'
   : r.st === '帳簿なし' ? 'GENの帳簿にないコード。マスタ・QRを確認' : r.st === '未カウント' ? '数えていない。再修正に入れるか、在庫0なら設定で0出力'
@@ -11344,7 +11345,7 @@ function scrMasterImport() {
 /* 集計(v3.6): 1 CSVを選ぶ → 2 集計する → 3 差異リストを印刷 → 4 数え直した数を入れる → 5 GEN取込CSVを作る。Excel は使わない */
 function scrAgg() {
   const A = S.agg, o = A.opt, R = A.result, book = A.book, sb = savedBook();
-  const F = ['すべて', '差異あり', '未カウント', '帳簿なし', '修正済', '修正済・差異あり', '差異なし'];
+  const F = ['すべて', '差異あり', '未カウント', '帳簿なし', '対象外', '修正済', '修正済・差異あり', '差異なし'];
   const shown = R ? R.rows.filter(r => A.filter === 'すべて' || r.st === A.filter) : [];
   const cnt = k => R ? (k === 'すべて' ? R.rows.length : R.rows.filter(r => r.st === k).length) : 0;
   const D = diffRows(), adj = adjOf(), nIn = D.filter(r => adj[r.code]).length;
