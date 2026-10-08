@@ -36,6 +36,7 @@ header.bar h1{font-size:17px;margin:0;font-weight:700;flex:1;min-width:0;overflo
 .ver{font-size:12px;white-space:nowrap;opacity:.75}
 main{padding:14px 16px}
 h2{font-size:15px;margin:22px 0 8px;color:var(--steel);font-weight:700}
+.gflow{list-style:none;margin:6px 0;padding:0;counter-reset:g}.gflow li{position:relative;border:2px solid var(--steel);border-radius:10px;background:#fff;padding:8px 10px 8px 12px;margin:0 0 18px;display:flex;flex-direction:column;gap:2px}.gflow li:not(:last-child)::after{content:'▼';position:absolute;left:50%;bottom:-19px;transform:translateX(-50%);color:var(--steel);font-size:14px;line-height:1}.gwho{align-self:flex-start;font-size:11px;font-weight:700;color:#fff;border-radius:9px;padding:1px 8px}.g-c{background:#3b7d3b}.g-a{background:var(--steel)}.g-s{background:#8a6d00}.gsec{margin-top:10px}.gsec summary{cursor:pointer;padding:2px 0}.gbody ol,.gbody ul{margin:6px 0;padding-left:1.4em}.gbody li{margin:3px 0}.gbody table.diff td:first-child{white-space:nowrap;font-weight:700;vertical-align:top}
 h2.step{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:16px}
 table.rc th{white-space:nowrap}table.rc td.num{white-space:nowrap;text-align:right}table.rc input{width:100%;min-width:90px;box-sizing:border-box}
 h2.step .no{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:var(--steel);color:#fff;font-size:14px}
@@ -10264,7 +10265,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
            マスタCSVの読み込みは統合(端末の未共有の変更を残す)/ GEN向けCSVは Shift-JIS を選べる /
            ホーム画面以外で開いた時・書き出し忘れの警告 / 書き出したCSVから履歴を戻す
    ========================================================= */
-const APP_VERSION = 'file-3.9.1';
+const APP_VERSION = 'file-3.10';
 /* v3.2(2026-10-05)運用の決定: 再カウントは紙で行い、修正は管理者が「集約CSV」に直接行う。
    アプリの再修正モード・PCで数を直す機能は画面から隠す(仕組みは残す。true にすれば戻る) */
 const FEATURE_RECOUNT = false;
@@ -10814,7 +10815,7 @@ function runAgg() {
     // v3.9.1: 品目マスタにあるが棚卸対象外の品目(頭文字が対象外・GEN で非表示)を「マスタ外」などで記録した時は「対象外」。GEN取込には入れない
     const st = (it && !isTarget(it)) ? '対象外' : pending ? '再修正中' : !b ? '帳簿なし' : (!list.length && !a) ? '未カウント'
       : fixed ? (diff === 0 ? '修正済' : '修正済・差異あり') : (diff === 0 ? '差異なし' : '差異あり');
-    out.push({ code, name: b?.name || it?.ItemName || list[0]?.ItemName || '', unit: b?.unit || it?.Unit || '', book: bookQty, qty, first: sum(first), diff, st, inBook: !!b,
+    out.push({ code, name: b?.name || it?.ItemName || list[0]?.ItemName || '', unit: b?.unit || it?.Unit || '', book: bookQty, qty, raw: devQty, first: sum(first), diff, st, inBook: !!b,
       n: latest.length, v: voids.get(code) || 0, who: uniq(list, r => r.Counter), loc: uniq(latest, r => r.Location), loc1: uniq(first, r => r.Location),
       round: maxR, method, reason, fixedBy, fixedAt, warn, late: lateN, req: rq ? rq.round : 0 });
   }
@@ -11037,7 +11038,7 @@ async function prepSet(files, ses) {
    対象 = 集計で「差異あり・未カウント・帳簿なし」になった品目と、数え直しの数を入れた品目。紙(差異リスト)と同じ品目コード順 */
 const DIFF_ST = ['差異あり', '未カウント', '帳簿なし', '対象外', '修正済', '修正済・差異あり'];
 const diffRows = () => { const R = S.agg.result; return R ? R.rows.filter(r => DIFF_ST.includes(r.st)).sort((a, b) => a.code.localeCompare(b.code)) : []; };
-const firstQty = r => { const a = adjOf()[r.code]; return a && a.base != null ? a.base : r.qty; };   // 数え直す前(集計)の数
+const firstQty = r => r.raw != null ? r.raw : r.qty;   // 数え直す前(担当者の登録の合計)の数。v3.9.2: 遅れて届いたCSVで集計し直しても最新になるよう、集計の結果から取る
 const stLabel = st => st === '修正済' ? '数え直し済' : st === '修正済・差異あり' ? '数え直し済(差あり)' : st;
 function printDiff() {
   const rows = diffRows(); if (!rows.length) return toast('差異のある品目はありません');
@@ -11075,7 +11076,7 @@ async function exportGenFinal() {
   if (!rows.length) return toast('出力できる品目がありません');
   const st = stamp(), ses = fileSafe(S.session), adj = adjOf(), byCode = new Map(R.rows.map(r => [r.code, r])), m = master();
   const files = [genFile(`GEN取込_${ses}_${st}.csv`, csv(GEN_HEAD, rows.map(r => [d, r.code, loc, '', r.qty])))];
-  const rec = Object.entries(adj).sort((a, b) => a[0].localeCompare(b[0])).map(([c, a]) => { const r = byCode.get(c); return [c, r?.name || m[c]?.ItemName || '', r?.unit || '', r ? r.book : '', a.base ?? '', a.qty, a.base != null ? rnd(a.qty - a.base) : '', r ? rnd(a.qty - r.book) : '', a.reason || '', a.by || '', fmtT(a.at)]; });
+  const rec = Object.entries(adj).sort((a, b) => a[0].localeCompare(b[0])).map(([c, a]) => { const r = byCode.get(c), base = r ? firstQty(r) : (a.base ?? ''); return [c, r?.name || m[c]?.ItemName || '', r?.unit || '', r ? r.book : '', base, a.qty, base !== '' ? rnd(a.qty - base) : '', r ? rnd(a.qty - r.book) : '', a.reason || '', a.by || '', fmtT(a.at)]; });
   if (rec.length) files.push({ name: `修正記録_${ses}_${st}.csv`, text: csv(['品目コード', '品目名', '単位', '帳簿', '集計の数', '数え直した数', '直した差', '帳簿との差', 'メモ', '入力者', '入力日時'], rec) });
   await shareFilesOrDownload(files);
   S.agg.done = { gen: files[0].name, rec: rec.length ? files[1].name : '', n: rows.length, nRec: rec.length, excluded: excluded.length };
@@ -11128,7 +11129,7 @@ function notices() {
 }
 function tabs() {
   const t = [['scan', '読取', ICON.scan], ['history', '履歴', ICON.hist], ['export', '書き出し', ICON.out, unexported().length], ...(rcReq() ? [['recount', '再修正', ICON.rc, rcLeft()]] : []), ['master', 'マスタ', ICON.mst], ['setting', '設定', ICON.set]];
-  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting', tools: 'setting', todo: 'scan' }[S.screen] || S.screen;
+  const cur = { masterEdit: 'master', masterImport: 'master', agg: 'setting', book: 'setting', tools: 'setting', guide: 'setting', todo: 'scan' }[S.screen] || S.screen;
   return `<nav class="tabs" aria-label="画面"><div class="in">${t.map(([k, l, ic, b]) => `<button data-go="${k}" ${cur === k ? 'aria-current="page"' : ''}>${ic}${b ? `<span class="badge">${b}</span>` : ''}<span>${l}</span></button>`).join('')}</div></nav>`;
 }
 function scrScan() {
@@ -11154,7 +11155,7 @@ function scrScan() {
       <button class="btn primary big" data-act="camOpen" style="flex:1.2">カメラで読む</button>
       <input type="text" id="codeIn" placeholder="品目コード または 品名で探す" value="${esc(S.codeQuery || S.code)}" autocapitalize="off" autocomplete="off" enterkeyhint="search" aria-label="品目コード または 品名">
     </div>
-    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="photoScan">写真で読む(カメラが真っ暗な時)</button>${savedBook() && !rcm ? `<button class="btn sm" data-go="todo">在庫がある品目の一覧(未登録 ${todoItems().left.length})</button>` : ''}</div>
+    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="photoScan">写真で読む(カメラが真っ暗な時)</button><button class="btn sm" data-go="guide">使い方</button>${savedBook() && !rcm ? `<button class="btn sm" data-go="todo">在庫がある品目の一覧(未登録 ${todoItems().left.length})</button>` : ''}</div>
     <div id="sugg">${S.codeQuery ? suggHtml(S.codeQuery) : ''}</div>
     ${unknown && !rcm ? `
     <div class="field"><label for="unkName">品名などのメモ(必須)</label><input type="text" id="unkName" value="${esc(S.unkName || '')}" autocomplete="off" placeholder="例 ○○のパレット(コードなし)"></div>
@@ -11460,16 +11461,16 @@ function scrTools() {
   const step = (n, title, when) => `<h2 class="step"><span class="no">${n}</span>${title}<span class="muted small" style="font-weight:normal">(${when})</span></h2>`;
   const ses = S.prepSes ?? normSession(S.session);
   return bar('管理者メニュー(PC)') + `<main>
-    <button class="btn sm" data-go="setting">← 設定へ</button>
+    <div class="row"><button class="btn sm" data-go="setting">← 設定へ</button><button class="btn sm" data-go="guide">運用マニュアル</button></div>
     <p class="muted small">管理者がPCでする作業は <b>2つだけ</b> です。できたファイルは「ダウンロード」フォルダに入ります。</p>
     ${T.err ? `<div class="err">${esc(T.err)}</div>` : ''}
 
     ${step(1, '棚卸セットを作って配る', '棚卸の前')}
     <div class="panel">
-      <p class="small" style="margin-top:0">先に2つ用意します。<b>品目マスタ</b>: 「品目マスタをAPIで取得.bat」をダブルクリック(.bat が動くPC。できない時は GEN の品目マスタを絞り込みなしで「エクセル出力」)/ <b>在庫リスト</b>: GEN で「エクセル出力」。</p>
+      <p class="small" style="margin-top:0">共有フォルダ「<b>棚卸用</b>」の <b>品目マスタ.xlsx</b> と <b>在庫.xlsx</b> を使います(平日 12:15 に GEN から自動で更新。<b>今日の 12:15 以降の日付</b>か確かめる)。古い日は、GEN で品目マスタ(絞り込みなし)と在庫リストを「エクセル出力」して代わりに使えます。</p>
       <div class="field" style="margin-top:0"><label for="prepSes">① 棚卸回(年-月)</label><input type="month" id="prepSes" value="${esc(ses)}"></div>
       <button class="btn primary big block" data-act="toolPrep" style="margin-top:8px">② GEN の2つのファイルを選ぶ(まとめて選ぶ)</button>
-      <p class="muted small"><b>品目マスタ_API_….csv</b>(または 品目マスタ.xlsx)と <b>在庫リスト.xlsx</b> を、<b>Ctrl を押しながら2つクリック</b>して「開く」。どちらがどちらかは自動で見分けます。</p>
+      <p class="muted small"><b>品目マスタ.xlsx</b> と <b>在庫.xlsx</b> を、<b>Ctrl を押しながら2つクリック</b>して「開く」。どちらがどちらかは自動で見分けます(品目マスタ_API_….csv・在庫リスト.xlsx でも可)。</p>
       ${P ? `<div class="note"><b>できました: ${esc(P.set)}</b><br>
         品目マスタ: ${esc(P.sum)}<br>在庫リスト: ${P.nStock}品目(在庫が0以外 ${P.nStockNz})/ 棚卸対象 ${P.nTarget}品目・そのうち在庫がある ${P.nTodo}品目
         ${P.ng ? `<br><span style="color:var(--bad)">在庫があるのに品目マスタにない・非表示の品目が ${P.ng}件あります(その他 → 在庫リストの画面で確認)</span>` : ''}</div>
@@ -11519,6 +11520,7 @@ function scrTools() {
 }
 function scrSetting() {
   return bar('設定') + `<main>
+    <button class="btn primary block" data-go="guide" style="margin-top:4px">運用マニュアル(使い方)を見る</button>
     <h2>担当者の名前(CSVのファイル名に入ります)</h2>
     <div class="panel">
       <div class="field" style="margin-top:0"><label for="nameIn">担当者の名前</label><input type="text" id="nameIn" value="${esc(S.user.name)}" autocomplete="off"></div>
@@ -11542,7 +11544,88 @@ function scrSetting() {
     <p class="muted small">数える人は使いません。</p>
   </main>`;
 }
-const SCREENS = { scan: scrScan, todo: scrTodo, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, tools: scrTools, setting: scrSetting };
+/* 運用マニュアル(v3.10・アプリの中の簡易版)。画像は使わず、電波がなくても見られる。くわしい手順書(PDF)は管理者が配る。
+   公開URLに載るので、人の名前・品目コード・社名は書かない */
+function scrGuide() {
+  const role = S.guideRole || (S.screen === 'guide' && S.guideFrom === 'tools' ? 'admin' : 'count');
+  const tab = (k, l) => `<button class="chip" data-guide="${k}" aria-pressed="${role === k}">${l}</button>`;
+  const flow = (items) => `<ol class="gflow">${items.map(([who, t, sub]) => `<li><span class="gwho g-${who}">${{ c: '数える人', a: '管理者', s: '総務' }[who]}</span><b>${t}</b>${sub ? `<span class="muted small">${sub}</span>` : ''}</li>`).join('')}</ol>`;
+  const sec = (title, body, open) => `<details class="panel gsec" ${open ? 'open' : ''}><summary><b>${title}</b></summary><div class="gbody">${body}</div></details>`;
+  const go = (scr, label) => `<button class="btn sm" data-go="${scr}">${label} →</button>`;
+  const all = flow([
+    ['a', '棚卸セットを作って、サイボウズで配る', '共有フォルダ「棚卸用」の 品目マスタ.xlsx・在庫.xlsx から(管理者メニュー「1」)'],
+    ['c', '棚卸セットを読み込む', 'マスタ →「棚卸セットを読み込む」(棚卸のたびに1回)'],
+    ['c', 'QRを読んで数える', '見つけるたびに1回ずつ登録'],
+    ['c', 'CSVを書き出して、Teams の「棚卸」に送る', 'ここで数える人の作業は終わり'],
+    ['a', '集計 → 差異リストを印刷 → 紙で数え直す → 数を入れる', '管理者メニュー「2」→ 集計の画面 1〜5'],
+    ['a', 'GEN取込CSVを作って、サイボウズの専用チャットで総務へ提出', 'これで棚卸完了(GEN への取り込みは総務)'],
+  ]);
+  const count = [
+    sec('1. 最初に1回だけ', `<ol>
+      <li>管理者から届いたURLを <b>Safari</b> で開き、共有ボタン →「<b>ホーム画面に追加</b>」</li>
+      <li>これからは<b>ホーム画面の「棚卸カウント」から開く</b>(Safari の画面とはデータが別です)</li>
+      <li>設定で<b>自分の名前</b>を入れて「保存」</li></ol>${go('setting', '設定を開く')}`, true),
+    sec('2. 棚卸のたびに: 棚卸セットを読み込む', `<ol>
+      <li>管理者がサイボウズで配る「<b>棚卸セット_….csv</b>」を開き、共有 →「"ファイル"に保存」</li>
+      <li>下の「マスタ」→「<b>棚卸セットを読み込む</b>」→ そのファイルを選ぶ</li>
+      <li>上に 棚卸回・品目の数・在庫がある品目の数 が出ればOK(棚卸回は自動で入ります)</li></ol>
+      <p class="muted small">前の棚卸の登録が残っている時は、先に書き出してから読み込みます。</p>${go('master', 'マスタを開く')}`),
+    sec('3. 当日: 数える', `<p><b>決まりは3つだけ</b></p><ul>
+      <li>見つけたら、<b>その都度1回ずつ</b>登録する(同じ品物を何回登録してもOK)</li>
+      <li>足し算はしない(合計は管理者がします)</li>
+      <li>置き場は空欄でOK</li></ul>
+      <ol><li>「<b>カメラで読む</b>」→ QRを枠に入れる</li><li>品名を確かめて、<b>数を入れて「登録」</b>(空の品物は 0)</li></ol>
+      <table class="diff"><tr><td>パレット・バラがある品物</td><td>先に<b>荷姿</b>(数えた単位)を選んでから数を入れる。換算した数が下に出る</td></tr>
+      <tr><td>カメラが真っ暗</td><td>2〜3秒待つ →「カメラ切替」→ だめなら「<b>写真で読む</b>」</td></tr>
+      <tr><td>QRが読めない</td><td>入力欄に品目コードか<b>品名の一部</b>(ひらがなでも可)→ 候補を押す</td></tr>
+      <tr><td>「マスタにない品物」と出た</td><td>コードを確かめて、合っていれば<b>品名などのメモと数</b>を入れて「マスタ外として記録」</td></tr>
+      <tr><td>まちがえた</td><td>下の「履歴」→「<b>取消</b>」を2回押す → 正しく登録し直す</td></tr>
+      <tr><td>数え忘れの確認</td><td>読取画面の「<b>在庫がある品目の一覧</b>」= 在庫があるのに、この端末でまだ登録していない品物(数は出ない)</td></tr></table>
+      ${go('scan', '読取を開く')}`),
+    sec('4. 終わったら: Teams に送る', `<ol>
+      <li>下の「書き出し」→「<b>CSVを書き出す</b>」</li>
+      <li>共有の画面で <b>Teams</b> →「<b>棚卸</b>」を選んで送る</li>
+      <li>「<b>未書き出し: 0件</b>」になればOK → 管理者に「送りました」と伝えて<b>終わり</b></li></ol>
+      <p class="muted small">休けいの時にも書き出して送ると安心です(iPhone のデータが消えても戻せます)。数え直しは管理者が紙で行います。</p>${go('export', '書き出しを開く')}`),
+  ].join('');
+  const admin = [
+    sec('1. 棚卸の前: 棚卸セットを作って配る', `<ol>
+      <li>共有フォルダ「<b>棚卸用</b>」の <b>品目マスタ.xlsx</b> と <b>在庫.xlsx</b> の日付を確かめる(平日 12:15 に GEN から自動で更新。<b>棚卸セットを作る日の 12:15 以降</b>ならOK)</li>
+      <li>管理者メニュー「1」→ <b>棚卸回</b>(年-月)を選ぶ →「GEN の2つのファイルを選ぶ」→ 2つを <b>Ctrl を押しながら</b>選んで「開く」</li>
+      <li>「できました: 棚卸セット_…」と出たら、その <b>1ファイルだけ</b>をサイボウズで配る(Excel で開いて保存しない)</li></ol>
+      <p class="muted small">「棚卸用」が古い日は、GEN で品目マスタ(絞り込みなし)と在庫リストを「エクセル出力」して代わりに使えます。荷姿・コードのないパレットは、管理者メニュー → その他 →「品目マスタを編集する」で登録しておくと棚卸セットに入ります。</p>${go('tools', '管理者メニューを開く')}`, true),
+    sec('2. 全員が送ったら: 集計する(集計の画面 1〜3)', `<ol>
+      <li><b>1</b>「CSVをまとめて選ぶ」→ Teams の「棚卸」のファイルを全部 → <b>全員の名前</b>が出ているか確認</li>
+      <li><b>2</b> 棚卸日を入れて「<b>集計する</b>」</li>
+      <li><b>3</b> 状態を確認して「<b>差異リストを印刷する</b>」→ 紙を持って倉庫で数え直し、「数え直した数」に書く</li></ol>
+      <table class="diff"><tr><td>差異あり</td><td>在庫リストと違う → 数え直す</td></tr><tr><td>未カウント</td><td>在庫があるのに登録がない → 確かめる(何も入れなければ 0)</td></tr>
+      <tr><td>帳簿なし・対象外</td><td>マスタ外の記録・パレット・対象外の品目。GEN取込には入らない</td></tr></table>${go('agg', '集計の画面を開く')}`),
+    sec('3. 数え直した数を入れて、提出する(集計の画面 4〜5)', `<ol>
+      <li><b>4</b> 紙と同じ順番(品目コード順)で「<b>数え直した数</b>」を入れる(Enter で次の行。<b>空欄は集計の数のまま</b>)</li>
+      <li><b>5</b>「<b>GEN取込CSVを作る</b>」→ GEN取込_….csv と 修正記録_….csv ができる</li>
+      <li>GEN取込_….csv を <b>サイボウズの専用チャットで総務へ提出</b> → <b>棚卸完了</b>(修正記録は Teams の「棚卸」に保存)</li></ol>
+      <p class="muted small">提出した後に数を直した時は、作り直して提出し直します。</p>`),
+  ].join('');
+  const faq = sec('困った時', `<table class="diff">
+    <tr><td>上に黄色い「Safari で開いています」</td><td>ホーム画面の「棚卸カウント」から開き直す</td></tr>
+    <tr><td>「棚卸セットが入っていません」</td><td>マスタ →「棚卸セットを読み込む」</td></tr>
+    <tr><td>サイボウズのファイルが選べない</td><td>サイボウズで開いて、共有 →「"ファイル"に保存」してから選ぶ</td></tr>
+    <tr><td>「新しい版のアプリが届きました」</td><td>「開き直す」を押す(登録は消えない)</td></tr>
+    <tr><td>iPhone を替えた・データが消えた</td><td>書き出し →「書き出したCSVから履歴を戻す」</td></tr>
+    <tr><td>集計に名前が足りない</td><td>その人に Teams の「棚卸」へ送ってもらう</td></tr>
+    <tr><td>「2つまとめて選んでください」</td><td>Ctrl を押しながら2つクリックして選び直す</td></tr>
+    <tr><td>それ以外</td><td>無理に進めずに、管理者に聞く</td></tr></table>`);
+  return bar('運用マニュアル') + `<main>
+    <button class="btn sm" data-go="${S.guideFrom || 'setting'}">← もどる</button>
+    <p class="muted small">アプリの中の簡易版です。画面の画像つきのくわしい手順書は、管理者が配る PDF を見てください。</p>
+    <h2>全体の流れ</h2>${all}
+    <div class="chips" role="group" style="margin-top:12px">${tab('count', '数える人(iPhone)')}${tab('admin', '管理者(PC)')}</div>
+    ${role === 'admin' ? admin : count}
+    ${faq}
+    <p class="muted small" style="margin-top:12px">${esc(APP_VERSION_LABEL)}・棚卸回 ${esc(S.session || '未設定')}</p>
+  </main>`;
+}
+const SCREENS = { scan: scrScan, todo: scrTodo, history: scrHistory, export: scrExport, recount: scrRecount, agg: scrAgg, book: scrBook, master: scrMaster, masterEdit: scrMasterEdit, masterImport: scrMasterImport, tools: scrTools, guide: scrGuide, setting: scrSetting };
 function render() {
   const y = window.scrollY, act = document.activeElement?.id;
   $('#app').innerHTML = (SCREENS[S.screen] || scrScan)() + tabs();
@@ -11550,6 +11633,7 @@ function render() {
   window.scrollTo(0, y);
 }
 function go(screen) {
+  if (screen === 'guide' && S.screen !== 'guide') { S.guideFrom = S.screen; S.guideRole = ['tools', 'agg', 'book'].includes(S.screen) ? 'admin' : 'count'; }   // v3.10 運用マニュアル
   if (screen === 'tools' && S.screen === 'setting') S.tools = { master: null, stock: null, shu: null, err: '' };   // 設定から開き直した時は前の結果を消す
   S.armed = null; S.screen = screen;
   if (screen === 'agg' && !S.agg.book) { const sb = savedBook(); if (sb && !sb.flagOnly) S.agg.book = sb.map; }   // 棚卸の前に読み込んだ帳簿在庫を使う(配布用=数なしは照合に使えない)
@@ -11858,7 +11942,8 @@ const ACTIONS = {
   resetMaster: () => { if (S.armed !== 'resetMaster') { S.armed = 'resetMaster'; return render(); } LS.del('f_master'); LS.del('f_master_at'); S.armed = null; toast('品目マスタを消しました。マスタ →「棚卸セットを読み込む」で読み込み直してください', 4000); render(); },
 };
 document.addEventListener('click', async ev => {
-  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick],[data-rcpick],[data-ao],[data-tpick]'); if (!el) return; const d = el.dataset;
+  const el = ev.target.closest('[data-go],[data-act],[data-void],[data-mf],[data-mi],[data-af],[data-pick],[data-rcpick],[data-ao],[data-tpick],[data-guide]'); if (!el) return; const d = el.dataset;
+  if (d.guide) { S.guideRole = d.guide; return render(); }
   if (d.pick) return pickItem(d.pick);
   if (d.tpick) { S.code = d.tpick; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; go('scan'); setTimeout(() => $('#qtyIn')?.focus(), 50); return; }
   if (d.rcpick) { S.rcMode = true; LS.set('f_rc_mode', true); S.code = d.rcpick; S.codeQuery = ''; S.qty = ''; S.packIdx = 0; go('scan'); if (lookup(d.rcpick)) setTimeout(() => $('#qtyIn')?.focus(), 50); return; }
